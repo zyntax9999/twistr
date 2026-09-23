@@ -202,7 +202,8 @@ python twistr.py [domains...] [options]
 | `--outdir DIR` | | Write to DIR with an auto, timestamped, unique filename. |
 | `--timestamp` | | Add a date-time stamp to the output filename so each run is unique. |
 | `--live` | | Write matches to the output file **as they're found** (tail/copy mid-run). `domains` and `csv` only; the file is risk-sorted with a final atomic rewrite. |
-| `--progress {auto,bar,plain,none}` | `auto` | Progress display. `auto` = animated bar on a terminal, timestamped log lines when redirected/backgrounded. |
+| `--progress {auto,bar,plain,none}` | `auto` | Progress display. `auto` = animated bars (overall + current target) on a terminal, timestamped log lines when redirected/backgrounded. |
+| `-q, --quiet` | | Only warnings, errors, and the final summary — no header, progress, or per-target lines. With a stdout format (no `-o`) stderr goes silent, so `... -q --format domains` is clean for pipelines. |
 
 ---
 
