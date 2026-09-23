@@ -2351,9 +2351,10 @@ def main(argv=None):
                 bad = [r for r in results if r[1] != "ok"]
                 healthy = f"{len(good)}/{len(results)} resolvers healthy"
                 if not quiet:
-                    (ui.ok if not bad else ui.item)(
-                        *(("resolvers", healthy, "green") if not bad
-                          else (healthy,)))
+                    if bad:
+                        ui.item("resolvers", healthy, "yellow")
+                    else:
+                        ui.item("resolvers", healthy, "green")
                 if bad:
                     for ns, status, detail, _lat in bad:
                         nm = _RESOLVER_NAMES.get(_ns_host(ns), "")
