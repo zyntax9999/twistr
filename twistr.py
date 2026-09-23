@@ -420,6 +420,31 @@ class Permutation:
                     or self.dns_cname)
 
 
+class _GenStop(Exception):
+    """Raised internally to stop generation when a cap or memory budget is hit."""
+
+
+def _rss_bytes():
+    """Resident memory of this process in bytes (Linux); 0 if unavailable."""
+    try:
+        with open("/proc/self/statm") as fh:
+            return int(fh.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+    except Exception:
+        return 0
+
+
+def _avail_memory():
+    """Available system memory in bytes (Linux); 0 if unavailable."""
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable"):
+                    return int(line.split()[1]) * 1024
+    except Exception:
+        pass
+    return 0
+
+
 class DomainFuzzer:
     def __init__(self, domain: str, dictionary=None, tlds=None,
                  idn_policy=True):
@@ -431,6 +456,10 @@ class DomainFuzzer:
         self.tlds = tlds or _TLDS
         self._seen: set[str] = set()
         self.results: list[Permutation] = []
+        self.stopped_reason = None
+        self._limit = 0
+        self._mem_budget = 0
+        self._check_ctr = 0
 
     # -- helpers ---------------------------------------------------------- #
     def _add(self, fuzzer: str, new_name: str, tld: str | None = None):
@@ -470,6 +499,22 @@ class DomainFuzzer:
             Permutation(fuzzer, unicode_domain, ascii_domain,
                         target=self.original)
         )
+        # periodic guard so a giant dictionary can't OOM-kill the process:
+        # stop generating (and scan what we have) when a cap is reached
+        self._check_ctr += 1
+        if self._check_ctr >= 20000:
+            self._check_ctr = 0
+            if self._limit and len(self.results) >= self._limit:
+                self.stopped_reason = (
+                    f"reached --max-candidates ({self._limit:,})")
+                raise _GenStop
+            if self._mem_budget:
+                rss = _rss_bytes()
+                if rss and rss >= self._mem_budget:
+                    self.stopped_reason = (
+                        f"memory budget reached (~{rss // 2**20} MB) after "
+                        f"{len(self.results):,} candidates")
+                    raise _GenStop
 
     # -- individual fuzzers ---------------------------------------------- #
     def _omission(self):
@@ -635,9 +680,13 @@ class DomainFuzzer:
         "tld-swap": _tld_swap, "tld-typo": _tld_typo, "various": _various,
     }
 
-    def generate(self, fuzzers=None) -> list[Permutation]:
+    def generate(self, fuzzers=None, max_candidates=0, mem_budget=0):
         self.results.clear()
         self._seen.clear()
+        self.stopped_reason = None
+        self._limit = max_candidates
+        self._mem_budget = mem_budget
+        self._check_ctr = 0
         # keep the original first so scans can diff against it
         self.results.append(
             Permutation("original", self.original,
@@ -646,11 +695,20 @@ class DomainFuzzer:
         )
         self._seen.add(self.original)
         chosen = fuzzers or list(self._ALL)
-        for name in chosen:
-            fn = self._ALL.get(name)
-            if fn is None:
-                raise ValueError(f"unknown fuzzer: {name}")
-            fn(self)
+        try:
+            for name in chosen:
+                fn = self._ALL.get(name)
+                if fn is None:
+                    raise ValueError(f"unknown fuzzer: {name}")
+                fn(self)
+        except _GenStop:
+            pass          # hit the candidate/memory cap; scan what we have
+        # exact cap enforcement (the in-loop check only fires periodically)
+        if self._limit and len(self.results) > self._limit:
+            self.results = self.results[:self._limit]
+            if not self.stopped_reason:
+                self.stopped_reason = (
+                    f"reached --max-candidates ({self._limit:,})")
         return self.results
 
 
@@ -1390,17 +1448,20 @@ def run_scan(perms, *, processes, concurrency, timeout, nameservers,
 # Output
 # --------------------------------------------------------------------------- #
 
+def _passes(perm, only_registered, min_length=0):
+    """Whether a result would appear in the output (excludes the original)."""
+    if perm.fuzzer == "original":
+        return False
+    if only_registered and not perm.registered:
+        return False
+    if min_length and len(perm.domain) < min_length:
+        return False
+    return True
+
+
 def _rows(perms, only_registered, min_length=0):
-    rows = []
-    for p in sorted(perms, key=lambda x: (x.target, -x.risk, x.fuzzer,
-                                          x.domain)):
-        if p.fuzzer == "original":
-            continue
-        if only_registered and not p.registered:
-            continue
-        if min_length and len(p.domain) < min_length:
-            continue
-        rows.append(p)
+    rows = [p for p in perms if _passes(p, only_registered, min_length)]
+    rows.sort(key=lambda x: (x.target, -x.risk, x.fuzzer, x.domain))
     return rows
 
 
@@ -1593,6 +1654,11 @@ def build_parser():
                         "logs (crt.sh) - finds real cert-bearing impersonations")
     p.add_argument("--all-checks", action="store_true",
                    help="shortcut for --web --favicon --rdap --mx")
+    p.add_argument("--max-candidates", type=int, default=0, metavar="N",
+                   help="stop generating a target's permutations after N "
+                        "candidates (0 = unlimited). Protects against giant "
+                        "dictionaries; twistr also self-limits near memory "
+                        "exhaustion.")
     p.add_argument("--no-scan", action="store_true",
                    help="only generate permutations, do not query DNS")
     p.add_argument("--concurrency", type=int, default=64,
@@ -1744,34 +1810,6 @@ def main(argv=None):
     if args.fuzzers:
         selected = [f.strip() for f in args.fuzzers.split(",") if f.strip()]
 
-    # generate permutations for every target into one pooled list
-    perms: list[Permutation] = []
-    for target in targets:
-        try:
-            fuzzer = DomainFuzzer(target, dictionary=dictionary, tlds=tlds,
-                                  idn_policy=not args.all_idn)
-        except ValueError as e:
-            print(f"skip {target!r}: {e}", file=sys.stderr)
-            continue
-        try:
-            tp = fuzzer.generate(selected)
-        except ValueError as e:
-            print(f"error: {e} (use --list-fuzzers to see valid names)",
-                  file=sys.stderr)
-            return 2
-        perms += tp
-        print(f"generated {len(tp) - 1} permutations of {fuzzer.original}",
-              file=sys.stderr)
-
-    if not perms:
-        print("error: no valid targets to scan", file=sys.stderr)
-        return 2
-
-    total_generated = _generated_count(perms)
-    if len(targets) > 1:
-        print(f"total {total_generated} permutations across "
-              f"{len(targets)} targets", file=sys.stderr)
-
     # resolve which detection checks are on
     do_web = args.web or args.favicon or args.all_checks
     do_favicon = args.favicon or args.all_checks
@@ -1784,22 +1822,46 @@ def main(argv=None):
         print("note: install ppdeep for homepage content-similarity scoring",
               file=sys.stderr)
 
-    # passive discovery via Certificate Transparency logs (crt.sh)
-    if args.ct and not args.no_scan:
-        seen_reg = {p.domain for p in perms}
-        added = 0
-        for target in {p.target for p in perms if p.fuzzer == "original"}:
-            name = target.split(".", 1)[0]
-            found = ct_discover(target, name, seen_reg, timeout=max(20.0,
-                                                                    args.timeout))
-            perms += found
-            added += len(found)
-        print(f"ct: added {added} domains from Certificate Transparency logs",
-              file=sys.stderr)
-        total_generated = _generated_count(perms)
+    # generation guards: stop well before the OS OOM-killer fires (SIGKILL,
+    # which we could not otherwise report), and honour an explicit cap
+    avail = _avail_memory()
+    mem_budget = int(avail * 0.80) if avail else 0
+    max_cand = args.max_candidates
+    if dictionary and len(dictionary) * 4 > 500_000:
+        cap = (f", or at --max-candidates ({max_cand:,})" if max_cand else "")
+        print(f"note: dictionary has {len(dictionary):,} words -> up to "
+              f"~{len(dictionary) * 4:,} combosquatting candidates per target. "
+              f"twistr will cap generation near ~{mem_budget // 2**30} GB RAM"
+              f"{cap}.", file=sys.stderr)
+
+    # validate targets cheaply (constructing a fuzzer parses/splits but does
+    # not generate), so an invalid target is reported before any heavy work
+    valid = []
+    for t in targets:
+        try:
+            DomainFuzzer(t, dictionary=dictionary, tlds=tlds,
+                         idn_policy=not args.all_idn)
+            valid.append(t)
+        except ValueError as e:
+            print(f"skip {t!r}: {e}", file=sys.stderr)
+    targets = valid
+    if not targets:
+        print("error: no valid targets to scan", file=sys.stderr)
+        return 2
 
     ml = args.min_length
     out_path = _resolve_output_path(args, targets)
+
+    def gen(target):
+        fz = DomainFuzzer(target, dictionary=dictionary, tlds=tlds,
+                          idn_policy=not args.all_idn)
+        tp = fz.generate(selected, max_candidates=max_cand,
+                         mem_budget=mem_budget)
+        if fz.stopped_reason:
+            print(f"  note: {fz.original}: generation stopped early - "
+                  f"{fz.stopped_reason}; scanning the {_generated_count(tp):,} "
+                  f"generated so far", file=sys.stderr)
+        return fz, tp
 
     # set up live streaming to the output file, if requested and supported
     writer = None
@@ -1823,73 +1885,143 @@ def main(argv=None):
             return 2
         print(f"live: streaming matches to {out_path}", file=sys.stderr)
 
-    if not args.no_scan:
-        nameservers = (args.nameservers.split(",")
-                       if args.nameservers else None)
-        progress = Progress(mode=args.progress)
-        t0 = time.monotonic()
+    # Stream target-by-target when there are several: each is generated, scanned
+    # and then reduced to just the rows we'll output, so memory stays flat and a
+    # crash keeps every finished target (in the --live file). The single-pool
+    # path is used for one target, for --ct (needs the shared set), or for -P
+    # multiprocess sharding.
+    per_target = (not args.no_scan and args.processes <= 1 and not args.ct
+                  and len(targets) > 1)
 
-        # For a big list, generating every target's permutations into one pool
-        # would balloon memory and lose everything on a crash. Scan target by
-        # target instead (each still fully parallel), so memory stays flat and
-        # a --live file keeps every target already finished. One or few targets
-        # take the original single-pool path (best overlap, shared CT set).
-        per_target = (len(targets) > 8 and args.processes <= 1
-                      and not args.ct)
-        if per_target:
-            print(f"streaming {len(targets)} targets one at a time "
-                  f"(memory-bounded)", file=sys.stderr)
-            scanned = []
-            for idx, target in enumerate(targets, 1):
-                try:
-                    fz = DomainFuzzer(target, dictionary=dictionary,
-                                      tlds=tlds, idn_policy=not args.all_idn)
-                    tp = fz.generate(selected)
-                except ValueError as e:
-                    print(f"skip {target!r}: {e}", file=sys.stderr)
-                    continue
-                run_scan(tp, processes=1, concurrency=args.concurrency,
-                         timeout=args.timeout, nameservers=nameservers,
-                         do_web=do_web, do_rdap=do_rdap, do_favicon=do_favicon,
-                         do_mx=do_mx, progress=None,
-                         on_result=writer.feed if writer else None)
-                scanned.extend(tp)
-                d = _generated_count(tp)
-                lv = sum(1 for p in tp
-                         if p.registered and p.fuzzer != "original")
-                print(f"  [{idx}/{len(targets)}] {fz.original}: {lv} live "
-                      f"/ {d}", file=sys.stderr)
-            perms = scanned
-            total_generated = _generated_count(perms)
-        else:
-            perms = run_scan(perms, processes=max(1, args.processes),
-                             concurrency=args.concurrency, timeout=args.timeout,
-                             nameservers=nameservers, do_web=do_web,
-                             do_rdap=do_rdap, do_favicon=do_favicon,
-                             do_mx=do_mx, progress=progress,
+    live = lame = wild = unresolved = total_generated = 0
+
+    def tally(tp):
+        nonlocal live, lame, wild, unresolved, total_generated
+        for p in tp:
+            if p.fuzzer == "original":
+                continue
+            total_generated += 1
+            if p.registered:
+                live += 1
+            if p.dns_ns == ["!servfail"]:
+                lame += 1
+            if p.wildcard:
+                wild += 1
+            if getattr(p, "_dns", "") == "fail":
+                unresolved += 1
+
+    try:
+        if not args.no_scan:
+            nameservers = (args.nameservers.split(",")
+                           if args.nameservers else None)
+            progress = Progress(mode=args.progress)
+            t0 = time.monotonic()
+
+            if per_target:
+                print(f"streaming {len(targets)} targets one at a time "
+                      f"(memory-bounded)", file=sys.stderr)
+                perms = []
+                for idx, target in enumerate(targets, 1):
+                    try:
+                        fz, tp = gen(target)
+                    except ValueError as e:
+                        print(f"error: {e} (use --list-fuzzers to see valid "
+                              f"names)", file=sys.stderr)
+                        return 2
+                    run_scan(tp, processes=1, concurrency=args.concurrency,
+                             timeout=args.timeout, nameservers=nameservers,
+                             do_web=do_web, do_rdap=do_rdap,
+                             do_favicon=do_favicon, do_mx=do_mx, progress=None,
                              on_result=writer.feed if writer else None)
-        live = sum(1 for p in perms
-                   if p.registered and p.fuzzer != "original")
-        pnote = f" across {args.processes} processes" if args.processes > 1 else ""
-        print(f"scan complete{pnote}: {live} live / {total_generated} checked "
-              f"in {Progress._fmt(time.monotonic() - t0)}", file=sys.stderr)
-        lame = sum(1 for p in perms if p.dns_ns == ["!servfail"])
-        wild = sum(1 for p in perms if p.wildcard)
-        if wild:
-            print(f"  {wild} ignored: only resolve because the parent zone "
-                  f"answers for any name (wildcard DNS; flagged in csv/json)",
+                    tally(tp)
+                    lv = sum(1 for p in tp
+                             if p.registered and p.fuzzer != "original")
+                    # keep only rows that will be output, then drop the rest so
+                    # millions of non-matches do not accumulate across targets
+                    perms.extend(p for p in tp
+                                 if _passes(p, args.registered, ml))
+                    print(f"  [{idx}/{len(targets)}] {fz.original}: {lv} live "
+                          f"/ {_generated_count(tp):,}", file=sys.stderr)
+                    del tp
+            else:
+                perms = []
+                for target in targets:
+                    try:
+                        fz, tp = gen(target)
+                    except ValueError as e:
+                        print(f"error: {e} (use --list-fuzzers to see valid "
+                              f"names)", file=sys.stderr)
+                        return 2
+                    perms += tp
+                    print(f"generated {_generated_count(tp):,} permutations of "
+                          f"{fz.original}", file=sys.stderr)
+                if not perms:
+                    print("error: no valid targets to scan", file=sys.stderr)
+                    return 2
+                # passive discovery via Certificate Transparency logs (crt.sh)
+                if args.ct:
+                    seen_reg = {p.domain for p in perms}
+                    added = 0
+                    for target in {p.target for p in perms
+                                   if p.fuzzer == "original"}:
+                        name = target.split(".", 1)[0]
+                        found = ct_discover(target, name, seen_reg,
+                                            timeout=max(20.0, args.timeout))
+                        perms += found
+                        added += len(found)
+                    print(f"ct: added {added} domains from Certificate "
+                          f"Transparency logs", file=sys.stderr)
+                perms = run_scan(perms, processes=max(1, args.processes),
+                                 concurrency=args.concurrency,
+                                 timeout=args.timeout, nameservers=nameservers,
+                                 do_web=do_web, do_rdap=do_rdap,
+                                 do_favicon=do_favicon, do_mx=do_mx,
+                                 progress=progress,
+                                 on_result=writer.feed if writer else None)
+                tally(perms)
+
+            pnote = (f" across {args.processes} processes"
+                     if args.processes > 1 else "")
+            print(f"scan complete{pnote}: {live} live / {total_generated} "
+                  f"checked in {Progress._fmt(time.monotonic() - t0)}",
                   file=sys.stderr)
-        unresolved = sum(1 for p in perms if getattr(p, "_dns", "") == "fail")
-        if lame:
-            print(f"  {lame} registered with broken nameservers (SERVFAIL, "
-                  f"lame delegation) - counted as live", file=sys.stderr)
-        if unresolved:
-            print(f"  warning: {unresolved} domains could not be resolved even "
-                  f"after retry rounds; results may be incomplete. Use better "
-                  f"--nameservers or lower --concurrency", file=sys.stderr)
-    else:
-        for p in perms:
-            p.risk = score(p)
+            if wild:
+                print(f"  {wild} ignored: only resolve because the parent zone "
+                      f"answers for any name (wildcard DNS; flagged in "
+                      f"csv/json)", file=sys.stderr)
+            if lame:
+                print(f"  {lame} registered with broken nameservers (SERVFAIL, "
+                      f"lame delegation) - counted as live", file=sys.stderr)
+            if unresolved:
+                print(f"  warning: {unresolved} domains could not be resolved "
+                      f"even after retry rounds; results may be incomplete. Use "
+                      f"better --nameservers or lower --concurrency",
+                      file=sys.stderr)
+        else:
+            perms = []
+            for target in targets:
+                try:
+                    fz, tp = gen(target)
+                except ValueError as e:
+                    print(f"error: {e} (use --list-fuzzers to see valid names)",
+                          file=sys.stderr)
+                    return 2
+                perms += tp
+                print(f"generated {_generated_count(tp):,} permutations of "
+                      f"{fz.original}", file=sys.stderr)
+            if not perms:
+                print("error: no valid targets to scan", file=sys.stderr)
+                return 2
+            for p in perms:
+                p.risk = score(p)
+    except MemoryError:
+        print("error: ran out of memory. Reduce the --dictionary size, scan "
+              "fewer targets at once, or set --max-candidates. (twistr tries "
+              "to self-limit, but a hard cap is safest for very large runs.)",
+              file=sys.stderr)
+        if writer:
+            writer.close()
+        return 2
 
     if writer:
         writer.close()
