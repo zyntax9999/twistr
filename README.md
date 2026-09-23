@@ -165,6 +165,7 @@ python twistr.py [domains...] [options]
 | `--dictionary FILE` | Wordlist for the `dictionary` (combosquatting) fuzzer, one word per line. Replaces the built-in list. |
 | `--tld-file FILE` | Wordlist of TLDs for the `tld-swap` fuzzer, one per line. Replaces the built-in list. |
 | `--all-idn` | Also generate IDN lookalikes using characters the TLD's registry doesn't accept (off by default, since those can't be registered there). |
+| `--max-candidates N` | Stop generating a target's permutations after N candidates (0 = unlimited). Guards against giant dictionaries; twistr also self-limits as it approaches available memory. |
 | `--no-scan` | Only generate candidates; don't query DNS. Great for building lists or counting. |
 
 ### Detection (what to check on each candidate)
@@ -602,6 +603,31 @@ fi
 **`note: optional libs not found -> aiodns …`**
 Install the optional libraries for full speed/features (see [Install](#install)).
 The scan still runs without them.
+
+**The process printed `Killed`, or `error: ran out of memory`**
+You ran out of RAM. `Killed` is the Linux OOM-killer (it sends SIGKILL, which
+no program can trap — that's why there was no explanation). It almost always
+means a **huge `--dictionary`**: the combosquatting fuzzer produces ~4
+candidates per dictionary word, per target, so an 800k-word list makes ~3.4M
+candidates *for every target*. Fixes:
+- Use a **smaller dictionary** (most curated lists are a few hundred to a few
+  thousand words).
+- Set **`--max-candidates`** (e.g. `--max-candidates 500000`) to cap each
+  target's generation.
+- Scan **fewer targets per run**, or let the built-in per-target streaming do
+  it (it kicks in automatically for more than one target when not using `--ct`
+  or `-P`).
+
+twistr now watches its own memory during generation and will **stop early with
+a printed reason** rather than being killed — but a smaller dictionary or an
+explicit `--max-candidates` is the real fix. You'll see notes like:
+
+```
+note: dictionary has 812,004 words -> up to ~3,248,016 combosquatting candidates
+      per target. twistr will cap generation near ~13 GB RAM.
+note: northface.com: generation stopped early - memory budget reached (~13000 MB)
+      after 3,120,000 candidates; scanning the 3,120,000 generated so far
+```
 
 **`warning: N domains could not be resolved even after retry rounds`**
 Your resolver dropped queries under load. Use better `--nameservers`
