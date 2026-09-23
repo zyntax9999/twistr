@@ -22,6 +22,7 @@ background runs.
 - [Install](#install)
 - [Quick start](#quick-start)
 - [How it works](#how-it-works)
+- [What you'll see](#what-youll-see)
 - [Command-line reference](#command-line-reference)
 - [Fuzzers](#fuzzers)
 - [Output formats](#output-formats)
@@ -140,6 +141,56 @@ at the end so a busy resolver doesn't make you miss real domains.
 banners, page titles, content-similarity, favicon comparison, RDAP registration
 dates, and MX records. Everything feeds a single [risk score](#the-risk-score),
 and results are sorted worst-first.
+
+---
+
+## What you'll see
+
+On a terminal (with `rich` installed), twistr opens with a header panel that
+summarises the run, then a live dashboard while it scans:
+
+```
+╭─ twistr · scanning ───────────────────────────────────────────────────────────────╮
+│ overall  ━━━━━━━━╺━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  7/29 targets  503 live  eta ~4:12:10 │
+│ target   [8/29] northface-shop.com                                                 │
+│          ━━━━━━━━━━━━━━━━╺━━━━━━━━━━━━━━  41%  1.48M/3.62M  3 live  2,410/s  eta 15:02 │
+│                                                                                    │
+│ elapsed 1:02:11   checked 17.2M   avg 2,380/s   mem 2.1 GB   wildcard 12   lame 3  │
+│                                                                                    │
+│ recent finds                                                                       │
+│ 67  northfaceshop-sale.com   northface-shop.com   dictionary   4s ago              │
+│ 44  thenorthface.cm          thenorthface.com     tld-typo     1m ago              │
+╰────────────────────────────────────────────────────────────────────────────────────╯
+```
+
+- **overall**: targets finished, live lookalikes so far, and an estimate for
+  the whole run (based on your actual speed and the size of targets so far).
+- **target**: the current target's progress, hits, speed and ETA.
+- **stats line**: elapsed time, total checked, average speed, memory in use, and
+  DNS health (wildcards ignored, lame delegations, unresolved).
+- **recent finds**: the newest live lookalikes as they appear, with risk score.
+
+Each finished target leaves a line above the dashboard:
+
+```
+done [7/29] northface-sale.com  12 live  299,999 checked  2:05 (2,399/s)  top northface-sale.shop (72)
+```
+
+At the end you get a **results** panel: totals and risk mix (high/medium/low),
+DNS notes, findings by fuzzer, the output file, a **per-target table**, and the
+**top findings** across all targets with where each one resolves to.
+
+**Under `nohup` or when redirected to a file**, the same information is written
+as plain timestamped lines (no colours or cursor codes), so `tail -f` works:
+a header, `[i/n] target: 41% ... | run: 503 live, ~4:12:10 left | latest: ...`
+status lines about once a minute on long targets, a `done` line per target, and
+the results summary.
+
+Without `rich`, a terminal gets a single in-place progress bar instead of the
+dashboard. `NO_COLOR=1` turns colours off. `-q` shows only warnings, errors
+and the summary. **Ctrl-C** stops cleanly: the dashboard is removed, the
+terminal is restored, and it tells you where the matches found so far were
+saved (with `--live`).
 
 ---
 
