@@ -1,0 +1,27 @@
+twistr
+Copyright 2026 [YOUR NAME OR GITHUB HANDLE]
+
+Licensed under the Apache License, Version 2.0 (the "License"); see the
+accompanying LICENSE file, or http://www.apache.org/licenses/LICENSE-2.0
+
+------------------------------------------------------------------------------
+Acknowledgements
+------------------------------------------------------------------------------
+
+This project is inspired by, and includes portions derived from:
+
+    dnstwist  —  https://github.com/elceef/dnstwist
+    Copyright Marcin Ulikowski <marcin@ulikowski.pl>
+    Licensed under the Apache License, Version 2.0.
+
+twistr is an independent, from-scratch reimplementation with a different
+architecture (asynchronous rather than threaded), and its own scanning,
+scoring, and output logic. Portions studied from dnstwist and adapted for
+use here include:
+
+  * the keyboard-adjacency maps used by the typo fuzzers,
+  * the homoglyph substitution method and part of its glyph data, and
+  * the per-registry IDN character tables.
+
+These portions have been modified and integrated into a new codebase. No
+endorsement by the dnstwist project or its author is claimed or implied.
