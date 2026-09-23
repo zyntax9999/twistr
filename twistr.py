@@ -1698,8 +1698,19 @@ def build_parser():
                         "multiple cores (helps most with --web/ppdeep or very "
                         "high concurrency; try your core count, e.g. 6)")
     p.add_argument("--timeout", type=float, default=5.0)
-    p.add_argument("--nameservers", help="comma-separated resolvers "
-                   "(needs aiodns), e.g. 1.1.1.1,8.8.4.4")
+    p.add_argument("--nameservers", metavar="LIST",
+                   help="comma-separated resolvers (needs aiodns), e.g. "
+                        "1.1.1.1,8.8.4.4 or 127.0.0.1:5335. The word "
+                        "'unfiltered' expands to a vetted set of 12 public "
+                        "resolvers from 6 providers that do not block domains. "
+                        "Known filtering resolvers are refused, because they "
+                        "hide phishing domains.")
+    p.add_argument("--allow-filtering-resolvers", action="store_true",
+                   help="allow resolvers known to filter/block domains "
+                        "(not recommended: blocked lookalikes look unregistered)")
+    p.add_argument("--check-resolvers", action="store_true",
+                   help="health-check the --nameservers (or the unfiltered "
+                        "preset if none given) and exit")
     p.add_argument("--progress", choices=["auto", "bar", "plain", "none"],
                    default="auto",
                    help="progress style: auto (bar on a terminal, log lines "
@@ -1798,6 +1809,185 @@ def _collect_targets(args):
     return cleaned
 
 
+# --------------------------------------------------------------------------- #
+# Resolver selection: unfiltered presets, filtering guard, health check
+# --------------------------------------------------------------------------- #
+
+# Public resolvers that do NOT filter by default. A filtering resolver hides
+# exactly what twistr hunts for: known phishing / malware domains get NXDOMAIN
+# (so they look unregistered) or a sinkhole / block-page address (a fake
+# answer). Spread across six providers so per-IP rate limits apply to each
+# provider separately.
+_UNFILTERED_RESOLVERS = [
+    ("1.1.1.1", "Cloudflare"), ("1.0.0.1", "Cloudflare"),
+    ("8.8.8.8", "Google"), ("8.8.4.4", "Google"),
+    ("9.9.9.10", "Quad9 unsecured"), ("149.112.112.10", "Quad9 unsecured"),
+    ("208.67.222.2", "OpenDNS Sandbox"), ("208.67.220.2", "OpenDNS Sandbox"),
+    ("94.140.14.140", "AdGuard non-filtering"),
+    ("94.140.14.141", "AdGuard non-filtering"),
+    ("76.76.2.0", "Control D unfiltered"), ("76.76.10.0", "Control D unfiltered"),
+]
+
+# Well-known resolvers that DO filter by default -> (what it is, unfiltered
+# alternative). Refused unless --allow-filtering-resolvers is given.
+_FILTERING_RESOLVERS = {
+    "9.9.9.9": ("Quad9 secure - blocks malicious domains", "9.9.9.10"),
+    "149.112.112.112": ("Quad9 secure - blocks malicious domains",
+                        "149.112.112.10"),
+    "9.9.9.11": ("Quad9 secure+ECS - blocks malicious domains", "9.9.9.10"),
+    "149.112.112.11": ("Quad9 secure+ECS - blocks malicious domains",
+                       "149.112.112.10"),
+    "2620:fe::fe": ("Quad9 secure - blocks malicious domains", "2620:fe::10"),
+    "2620:fe::9": ("Quad9 secure - blocks malicious domains", "2620:fe::fe:10"),
+    "1.1.1.2": ("Cloudflare for Families - blocks malware", "1.1.1.1"),
+    "1.0.0.2": ("Cloudflare for Families - blocks malware", "1.0.0.1"),
+    "1.1.1.3": ("Cloudflare for Families - blocks malware + adult", "1.1.1.1"),
+    "1.0.0.3": ("Cloudflare for Families - blocks malware + adult", "1.0.0.1"),
+    "2606:4700:4700::1112": ("Cloudflare for Families - blocks malware",
+                             "2606:4700:4700::1111"),
+    "2606:4700:4700::1113": ("Cloudflare for Families - blocks malware + adult",
+                             "2606:4700:4700::1111"),
+    "208.67.222.222": ("OpenDNS - blocks phishing by default", "208.67.222.2"),
+    "208.67.220.220": ("OpenDNS - blocks phishing by default", "208.67.220.2"),
+    "208.67.222.123": ("OpenDNS FamilyShield - content filter", "208.67.222.2"),
+    "208.67.220.123": ("OpenDNS FamilyShield - content filter", "208.67.220.2"),
+    "94.140.14.14": ("AdGuard default - blocks ads/trackers/phishing",
+                     "94.140.14.140"),
+    "94.140.15.15": ("AdGuard default - blocks ads/trackers/phishing",
+                     "94.140.14.141"),
+    "94.140.14.15": ("AdGuard Family - content filter", "94.140.14.140"),
+    "94.140.15.16": ("AdGuard Family - content filter", "94.140.14.141"),
+    "185.228.168.9": ("CleanBrowsing Security - filters", "1.1.1.1"),
+    "185.228.169.9": ("CleanBrowsing Security - filters", "1.0.0.1"),
+    "185.228.168.10": ("CleanBrowsing Adult - filters", "1.1.1.1"),
+    "185.228.169.11": ("CleanBrowsing Adult - filters", "1.0.0.1"),
+    "185.228.168.168": ("CleanBrowsing Family - filters", "1.1.1.1"),
+    "185.228.169.168": ("CleanBrowsing Family - filters", "1.0.0.1"),
+    "77.88.8.88": ("Yandex Safe - blocks fraud/malware", "77.88.8.8"),
+    "77.88.8.2": ("Yandex Safe - blocks fraud/malware", "77.88.8.1"),
+    "77.88.8.7": ("Yandex Family - content filter", "77.88.8.8"),
+    "77.88.8.3": ("Yandex Family - content filter", "77.88.8.1"),
+    "2606:4700:4700::1002": ("Cloudflare for Families - blocks malware",
+                             "2606:4700:4700::1001"),
+    "2606:4700:4700::1003": ("Cloudflare for Families - blocks malware + adult",
+                             "2606:4700:4700::1001"),
+    "76.76.2.1": ("Control D - blocks malware", "76.76.2.0"),
+    "76.76.10.1": ("Control D - blocks malware", "76.76.10.0"),
+    "76.76.2.2": ("Control D - blocks malware/ads/trackers", "76.76.2.0"),
+    "76.76.10.2": ("Control D - blocks malware/ads/trackers", "76.76.10.0"),
+    "76.76.2.3": ("Control D - blocks malware/ads/social", "76.76.2.0"),
+    "76.76.10.3": ("Control D - blocks malware/ads/social", "76.76.10.0"),
+    "76.76.2.4": ("Control D Family - content filter", "76.76.2.0"),
+    "76.76.10.4": ("Control D Family - content filter", "76.76.10.0"),
+    "86.54.11.1": ("DNS4EU protective - blocks malware/phishing", "1.1.1.1"),
+    "86.54.11.201": ("DNS4EU protective - blocks malware/phishing", "1.0.0.1"),
+    "86.54.11.11": ("DNS4EU child/no-ads - filters", "1.1.1.1"),
+    "86.54.11.211": ("DNS4EU child/no-ads - filters", "1.0.0.1"),
+    "86.54.11.12": ("DNS4EU child - filters", "1.1.1.1"),
+    "86.54.11.212": ("DNS4EU child - filters", "1.0.0.1"),
+    "86.54.11.13": ("DNS4EU no-ads - filters", "1.1.1.1"),
+    "86.54.11.213": ("DNS4EU no-ads - filters", "1.0.0.1"),
+}
+
+_RESOLVER_NAMES = dict(_UNFILTERED_RESOLVERS)
+
+
+def _ns_host(ns):
+    """Strip an optional :port (and [brackets] for IPv6) from a resolver spec."""
+    ns = ns.strip()
+    if ns.startswith("["):
+        return ns[1:ns.index("]")] if "]" in ns else ns[1:]
+    if ns.count(":") == 1:           # IPv4 or hostname with a port
+        return ns.split(":")[0]
+    return ns                        # bare IPv6 (or plain IPv4)
+
+
+def parse_nameservers(spec, allow_filtering=False):
+    """Expand a --nameservers value into a resolver list.
+    Accepts IPs (optionally ip:port) and the preset word 'unfiltered'.
+    Returns (list, error_message_or_None)."""
+    out = []
+    for tok in (t.strip() for t in spec.split(",")):
+        if not tok:
+            continue
+        if tok.lower() in ("unfiltered", "public"):
+            out.extend(ip for ip, _ in _UNFILTERED_RESOLVERS)
+        else:
+            out.append(tok)
+    seen, uniq = set(), []
+    for ns in out:
+        if ns not in seen:
+            seen.add(ns)
+            uniq.append(ns)
+    bad = [(ns, *_FILTERING_RESOLVERS[_ns_host(ns)]) for ns in uniq
+           if _ns_host(ns) in _FILTERING_RESOLVERS]
+    if bad and not allow_filtering:
+        lines = [f"    {ns:18} {what}  ->  use {alt} instead"
+                 for ns, what, alt in bad]
+        msg = ("these resolvers FILTER by default, which would hide exactly the "
+               "phishing/malware lookalikes twistr is looking for (blocked "
+               "names come back as 'does not exist' or as a fake block-page "
+               "address):\n" + "\n".join(lines) +
+               "\n  Use '--nameservers unfiltered' for a vetted unfiltered set, "
+               "or --allow-filtering-resolvers to override.")
+        return None, msg
+    return uniq, None
+
+
+async def _probe_one(ns, timeout):
+    """Health-check one resolver: must answer a real name, and must return
+    NXDOMAIN for a random non-existent one (not a fake address)."""
+    try:
+        r = aiodns.DNSResolver(nameservers=[ns], timeout=timeout, tries=1)
+        qfn = getattr(r, "query_dns", None) or r.query
+    except Exception as e:
+        return ns, "error", f"cannot create resolver: {e}", None
+    t = time.monotonic()
+    ok = False
+    for _ in range(2):
+        try:
+            await asyncio.wait_for(qfn("example.com", "A"), timeout)
+            ok = True
+            break
+        except Exception:
+            continue
+    latency = (time.monotonic() - t) * 1000
+    if not ok:
+        return ns, "dead", "no answer for example.com", None
+    fake = "zq" + "".join(random.choices(string.ascii_lowercase +
+                                         string.digits, k=16)) + ".com"
+    try:
+        res = await asyncio.wait_for(qfn(fake, "A"), timeout)
+        vals = Scanner._dns_values(res, "A")
+        return ns, "hijack", (f"answers {', '.join(vals) or 'something'} for a "
+                              f"name that does not exist (NXDOMAIN "
+                              f"rewriting)"), latency
+    except Exception as e:
+        code = e.args[0] if getattr(e, "args", None) else None
+        if code == 4:
+            return ns, "ok", "", latency
+        return ns, "ok", "did not return NXDOMAIN cleanly (kept)", latency
+
+
+def check_resolvers(nameservers, timeout=3.0):
+    """Probe every resolver concurrently; returns a list of result tuples."""
+    async def run():
+        return await asyncio.gather(*[_probe_one(ns, timeout)
+                                      for ns in nameservers])
+    return asyncio.run(run())
+
+
+def _report_resolvers(results, stream=sys.stderr):
+    for ns, status, detail, lat in results:
+        name = _RESOLVER_NAMES.get(_ns_host(ns), "")
+        label = f"{ns} ({name})" if name else ns
+        ms = f"{lat:5.0f} ms" if lat is not None else "     - "
+        tag = {"ok": "ok  ", "dead": "DEAD", "hijack": "BAD ",
+               "error": "ERR "}.get(status, status)
+        extra = f"  {detail}" if detail else ""
+        print(f"  [{tag}] {label:40} {ms}{extra}", file=stream)
+
+
 def _warn_missing():
     missing = []
     if not _HAVE_AIODNS:
@@ -1818,6 +2008,35 @@ def main(argv=None):
         for name in DomainFuzzer._ALL:
             print(f"  {name:<14} risk weight {_FUZZER_RISK.get(name, 1)}")
         return 0
+
+    if args.check_resolvers:
+        if not _HAVE_AIODNS:
+            print("error: --check-resolvers needs aiodns (pip install aiodns)",
+                  file=sys.stderr)
+            return 2
+        spec = args.nameservers or "unfiltered"
+        ns_list, err = parse_nameservers(spec, args.allow_filtering_resolvers)
+        if err:
+            print(f"error: {err}", file=sys.stderr)
+            return 2
+        print(f"checking {len(ns_list)} resolvers ...", file=sys.stderr)
+        results = check_resolvers(ns_list, timeout=min(args.timeout, 5.0))
+        _report_resolvers(results)
+        good = [r for r in results if r[1] == "ok"]
+        print(f"{len(good)}/{len(results)} usable", file=sys.stderr)
+        return 0 if len(good) == len(results) else 1
+
+    nameservers = None
+    if args.nameservers:
+        nameservers, err = parse_nameservers(args.nameservers,
+                                             args.allow_filtering_resolvers)
+        if err:
+            print(f"error: {err}", file=sys.stderr)
+            return 2
+        if not _HAVE_AIODNS:
+            print("warning: --nameservers needs aiodns (pip install aiodns); "
+                  "falling back to the system resolver", file=sys.stderr)
+            nameservers = None
 
     targets = _collect_targets(args)
     if not targets:
@@ -1943,8 +2162,29 @@ def main(argv=None):
 
     try:
         if not args.no_scan:
-            nameservers = (args.nameservers.split(",")
-                           if args.nameservers else None)
+            if nameservers:
+                results = check_resolvers(nameservers,
+                                          timeout=min(args.timeout, 5.0))
+                good = [r[0] for r in results if r[1] == "ok"]
+                bad = [r for r in results if r[1] != "ok"]
+                print(f"resolvers: {len(good)}/{len(results)} healthy",
+                      file=sys.stderr)
+                if bad:
+                    print("  dropping:", file=sys.stderr)
+                    _report_resolvers(bad)
+                if not good:
+                    print("error: none of the --nameservers answered correctly;"
+                          " check your network or run --check-resolvers",
+                          file=sys.stderr)
+                    if writer:
+                        writer.close()
+                    return 2
+                nameservers = good
+            elif _HAVE_AIODNS:
+                print("note: using the system resolver. If it filters (router "
+                      "or ISP content/threat filtering), blocked lookalikes "
+                      "will look unregistered - consider --nameservers "
+                      "unfiltered", file=sys.stderr)
             progress = Progress(mode=args.progress)
             t0 = time.monotonic()
 
@@ -2025,8 +2265,9 @@ def main(argv=None):
                       f"lame delegation) - counted as live", file=sys.stderr)
             if unresolved:
                 print(f"  warning: {unresolved} domains could not be resolved "
-                      f"even after retry rounds; results may be incomplete. Use "
-                      f"better --nameservers or lower --concurrency",
+                      f"even after retry rounds; results may be incomplete. Try "
+                      f"--nameservers unfiltered (spreads load over 6 providers)"
+                      f", a local resolver, or lower --concurrency",
                       file=sys.stderr)
         else:
             perms = []
