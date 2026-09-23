@@ -457,6 +457,8 @@ class DomainFuzzer:
         self._seen: set[str] = set()
         self.results: list[Permutation] = []
         self.stopped_reason = None
+        self.trim_note = None
+        self._dict_budget = None
         self._limit = 0
         self._mem_budget = 0
         self._check_ctr = 0
@@ -504,7 +506,7 @@ class DomainFuzzer:
         self._check_ctr += 1
         if self._check_ctr >= 20000:
             self._check_ctr = 0
-            if self._limit and len(self.results) >= self._limit:
+            if self._limit and len(self.results) - 1 > self._limit:
                 self.stopped_reason = (
                     f"reached --max-candidates ({self._limit:,})")
                 raise _GenStop
@@ -610,7 +612,22 @@ class DomainFuzzer:
 
     def _dictionary(self):
         n = self.name
-        for w in self.dictionary:
+        words = self.dictionary
+        budget = self._dict_budget
+        if budget is not None:
+            k = max(0, budget // 4)          # 4 candidate forms per word
+            if k < len(words):
+                # evenly spaced sample across the WHOLE list - a sorted
+                # dictionary cut at the first k words would only ever try
+                # words from the start of the alphabet
+                step = len(words) / k if k else 0
+                words = [words[int(i * step)] for i in range(k)]
+                self.trim_note = (
+                    f"dictionary trimmed to {len(words):,} of "
+                    f"{len(self.dictionary):,} words (sampled evenly across "
+                    f"the list) to fit --max-candidates {self._limit:,}; all "
+                    f"other fuzzers ran in full")
+        for w in words:
             self._add("dictionary", f"{n}{w}")
             self._add("dictionary", f"{n}-{w}")
             self._add("dictionary", f"{w}{n}")
@@ -695,17 +712,29 @@ class DomainFuzzer:
         )
         self._seen.add(self.original)
         chosen = fuzzers or list(self._ALL)
+        for name in chosen:
+            if name not in self._ALL:
+                raise ValueError(f"unknown fuzzer: {name}")
+        # the dictionary can be orders of magnitude larger than everything
+        # else combined, so it runs LAST and only gets the budget the other
+        # fuzzers leave - a cap must never starve tld-swap, tld-typo etc.
+        order = [f for f in chosen if f != "dictionary"]
+        if "dictionary" in chosen:
+            order.append("dictionary")
+        self._dict_budget = None
+        self.trim_note = None
         try:
-            for name in chosen:
-                fn = self._ALL.get(name)
-                if fn is None:
-                    raise ValueError(f"unknown fuzzer: {name}")
-                fn(self)
+            for name in order:
+                if name == "dictionary" and self._limit:
+                    self._dict_budget = max(
+                        0, self._limit - (len(self.results) - 1))
+                self._ALL[name](self)
         except _GenStop:
             pass          # hit the candidate/memory cap; scan what we have
-        # exact cap enforcement (the in-loop check only fires periodically)
-        if self._limit and len(self.results) > self._limit:
-            self.results = self.results[:self._limit]
+        # exact cap enforcement (the in-loop check only fires periodically);
+        # the cap counts candidates, not the original entry at index 0
+        if self._limit and len(self.results) - 1 > self._limit:
+            self.results = self.results[:self._limit + 1]
             if not self.stopped_reason:
                 self.stopped_reason = (
                     f"reached --max-candidates ({self._limit:,})")
@@ -1861,6 +1890,8 @@ def main(argv=None):
             print(f"  note: {fz.original}: generation stopped early - "
                   f"{fz.stopped_reason}; scanning the {_generated_count(tp):,} "
                   f"generated so far", file=sys.stderr)
+        elif fz.trim_note:
+            print(f"  note: {fz.original}: {fz.trim_note}", file=sys.stderr)
         return fz, tp
 
     # set up live streaming to the output file, if requested and supported
