@@ -60,6 +60,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import collections
 import concurrent.futures
 import csv
 import hashlib
@@ -76,6 +77,7 @@ import socket
 import string
 import sys
 import tempfile
+import threading
 import time
 import unicodedata
 import urllib.parse
@@ -756,12 +758,42 @@ def _valid_domain(ascii_domain: str) -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# Terminal UI helpers + adaptive progress reporting
+# Terminal UI: header / notes / summary, plus adaptive live progress
 # --------------------------------------------------------------------------- #
 
+def _human(n):
+    """Compact count: 9,999 / 123.4k / 3.62M."""
+    n = int(n)
+    if n < 10_000:
+        return f"{n:,}"
+    if n < 1_000_000:
+        return f"{n / 1000:.1f}k"
+    return f"{n / 1_000_000:.2f}M"
+
+
+def _fmt_dur(seconds):
+    seconds = int(max(0, seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h >= 24:
+        d, h = divmod(h, 24)
+        return f"{d}d{h:02d}h{m:02d}m"
+    return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+def _rstyle(style):
+    """Map this module's style names onto rich style names."""
+    return {"grey": "dim", None: ""}.get(style, style)
+
+
 class UI:
-    """Small styling helper: ANSI colour on a real terminal, plain text when
-    redirected to a file / nohup / pipe (with a timestamp so logs read well)."""
+    """All human-facing output (stderr).
+
+    * real terminal: colour, and rich panels/tables when `rich` is installed
+    * redirected (file / nohup / pipe): plain timestamped lines, no escape codes
+    While a live dashboard is on screen, lines are routed through its console
+    so they print above it instead of corrupting it.
+    """
 
     _CODES = {
         "reset": "0", "bold": "1", "dim": "2",
@@ -775,6 +807,15 @@ class UI:
         # honour NO_COLOR (https://no-color.org) and dumb terminals
         self.color = (self.tty and os.environ.get("NO_COLOR") is None
                       and os.environ.get("TERM") != "dumb")
+        self.rich = _HAVE_RICH and self.color
+        self.live_console = None
+        self._console = None
+
+    @property
+    def console(self):
+        if self._console is None:
+            self._console = Console(file=self.stream, highlight=False)
+        return self._console
 
     def c(self, text, *styles):
         if not self.color or not styles:
@@ -783,12 +824,19 @@ class UI:
         return f"\033[{codes}m{text}\033[0m" if codes else text
 
     def _emit(self, text):
+        if self.live_console is not None:
+            from rich.text import Text
+            self.live_console.print(Text.from_ansi(text))
+            return
         if self.tty or not text.strip():
             self.stream.write(text + "\n")
         else:
             ts = time.strftime("%H:%M:%S")
             self.stream.write(f"[{ts}] {text}\n")
         self.stream.flush()
+
+    def print_rich(self, renderable):
+        (self.live_console or self.console).print(renderable)
 
     def rule(self, title=""):
         if not self.tty:
@@ -805,9 +853,28 @@ class UI:
         self.stream.flush()
 
     def item(self, label, value, style=None):
-        lab = self.c(f"{label:>14}", "grey")
+        lab = self.c(f"{label:>12}", "grey")
         val = self.c(str(value), style) if style else str(value)
         self._emit(f"{lab}  {val}")
+
+    def header(self, title, rows):
+        """rows: [(label, value, style_or_None), ...]"""
+        if self.rich:
+            from rich.panel import Panel
+            from rich.table import Table
+            from rich.text import Text
+            grid = Table.grid(padding=(0, 2))
+            grid.add_column(style="dim", justify="right", no_wrap=True)
+            grid.add_column()
+            for label, value, style in rows:
+                grid.add_row(label, Text(str(value), style=_rstyle(style)))
+            self.print_rich(Panel(grid, title=f"[bold]{title}[/bold]",
+                                  title_align="left", border_style="blue",
+                                  expand=False, padding=(0, 1)))
+            return
+        self.rule(title)
+        for label, value, style in rows:
+            self.item(label, value, style)
 
     def note(self, text):
         self._emit(f"{self.c('note', 'cyan')}  {text}")
@@ -825,180 +892,444 @@ class UI:
         self._emit(text)
 
 
+class _ScanState:
+    """Counters shared by the progress renderers: what is done, how fast,
+    and an estimate of how long the whole run has left."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.t0 = None
+        self.n_targets = 1
+        self.targets_done = 0
+        self.in_target = False
+        self.cur_idx = 0
+        self.cur_name = ""
+        self.cur_total = 0
+        self.cur_done = 0
+        self.cur_live = 0
+        self.cur_t0 = None
+        self.prev_cand = 0          # candidates checked in finished targets
+        self.prev_live = 0
+        self.totals = []            # candidate count of every started target
+        self.wild = self.lame = self.unres = 0
+        self.recent = collections.deque(maxlen=8)
+
+    def begin(self, n_targets):
+        if self.t0 is None:
+            self.t0 = time.monotonic()
+        self.n_targets = max(1, n_targets)
+
+    def begin_target(self, idx, n, name, total):
+        self.begin(n)
+        self.cur_idx, self.cur_name = idx, name
+        self.cur_total, self.cur_done, self.cur_live = total, 0, 0
+        self.cur_t0 = time.monotonic()
+        self.in_target = True
+        self.totals.append(total)
+
+    def set_done(self, done, live):
+        self.cur_done, self.cur_live = done, live
+
+    def end_target(self):
+        if not self.in_target:
+            return
+        self.prev_cand += self.cur_done
+        self.prev_live += self.cur_live
+        self.targets_done += 1
+        self.in_target = False
+
+    def found(self, perm):
+        with self.lock:
+            self.recent.appendleft((perm.risk, perm.ascii, perm.target,
+                                    perm.fuzzer, time.monotonic()))
+
+    def recent_snapshot(self):
+        with self.lock:
+            return list(self.recent)
+
+    # -- derived numbers -------------------------------------------------- #
+    @property
+    def done_all(self):
+        return self.prev_cand + (self.cur_done if self.in_target else 0)
+
+    @property
+    def live_all(self):
+        return self.prev_live + (self.cur_live if self.in_target else 0)
+
+    def elapsed(self):
+        return time.monotonic() - self.t0 if self.t0 else 0.0
+
+    def rate(self):
+        e = self.elapsed()
+        return self.done_all / e if e > 0 else 0.0
+
+    def cur_rate(self):
+        if not self.cur_t0:
+            return 0.0
+        e = time.monotonic() - self.cur_t0
+        return self.cur_done / e if e > 0 else 0.0
+
+    def cur_eta(self):
+        r = self.cur_rate()
+        return (self.cur_total - self.cur_done) / r if r > 0 else None
+
+    def overall_eta(self):
+        r = self.rate()
+        if r <= 0:
+            return None
+        avg = (sum(self.totals) / len(self.totals)) if self.totals \
+            else self.cur_total
+        remaining = max(0, self.cur_total - self.cur_done) if self.in_target \
+            else 0
+        later = self.n_targets - self.targets_done - (1 if self.in_target else 0)
+        remaining += avg * max(0, later)
+        return remaining / r
+
+    def overall_frac(self):
+        frac_cur = (self.cur_done / self.cur_total
+                    if self.in_target and self.cur_total else 0.0)
+        return (self.targets_done + frac_cur) / self.n_targets
+
+
 class Progress:
-    """Renders scan progress differently depending on where output goes.
+    """Progress for plain terminals (in-place ASCII bar) and for redirected
+    output (throttled timestamped log lines that read well under `tail -f`).
+    The rich live view is `Dashboard`; both share this interface:
 
-    * Terminal + rich installed -> animated rich progress bar(s).
-    * Terminal only             -> in-place ASCII bar with %, rate and ETA.
-    * Redirected to a file / nohup / pipe -> periodic timestamped lines,
-      throttled so the log stays readable, flushed so `tail -f` works live.
-
-    Supports an optional second "sub" task (the current target within a
-    multi-target run) that shares the same display.
+      begin(n) / start_target(i, n, name, total) / update_target(done, live)
+      found(perm) / target_done(info) / start(total) / update(done, live)
+      finish(done, live) / set_counts(wild, lame, unresolved) / close()
     """
 
-    def __init__(self, mode="auto", stream=None, label="scanning", ui=None):
-        self.stream = stream or sys.stderr
+    def __init__(self, mode="auto", ui=None, label="scanning"):
+        self.ui = ui or UI()
+        self.stream = self.ui.stream
         self.label = label
-        self.ui = ui or UI(self.stream)
         tty = self.stream.isatty()
         if mode == "none":
             self.kind = "none"
-        elif mode == "plain":
+        elif mode == "plain" or not tty:
             self.kind = "plain"
-        elif mode == "bar":
-            self.kind = "rich" if _HAVE_RICH else "ascii"
-        else:  # auto
-            self.kind = ("rich" if (tty and _HAVE_RICH)
-                         else "ascii" if tty else "plain")
-        # an in-place \r bar only makes sense on a real terminal; if output is
-        # redirected (file / nohup / pipe) fall back to readable log lines
-        if self.kind == "ascii" and not tty:
-            self.kind = "plain"
-        self.total = 0
-        self.start_t = 0.0
-        self.last_emit = 0.0
-        self.last_pct = -1
-        self._rich = None
-        self._task = None
-        self._sub = None          # rich sub-task id (current target)
-        self._sub_desc = ""
-        self._sub_done = 0
-        self._sub_total = 0
+        else:
+            self.kind = "ascii"
+        self.s = _ScanState()
+        self._last_draw = 0.0
+        self._last_log = 0.0
+        self._last_pct = -1
+        self._bar_shown = False
 
-    @staticmethod
-    def _fmt(seconds):
-        seconds = int(max(0, seconds))
-        h, rem = divmod(seconds, 3600)
-        m, s = divmod(rem, 60)
-        return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+    _fmt = staticmethod(_fmt_dur)    # kept for callers of Progress._fmt
 
-    def start(self, total):
-        self.total = total
-        self.start_t = time.monotonic()
-        self.last_emit = self.start_t
-        self.last_pct = -1
-        if self.kind == "rich":
-            try:
-                from rich.progress import (
-                    Progress as RP, SpinnerColumn, BarColumn, TextColumn,
-                    MofNCompleteColumn, TimeElapsedColumn, TimeRemainingColumn)
-                self._rich = RP(
-                    SpinnerColumn(),
-                    TextColumn("[bold blue]{task.description}"),
-                    BarColumn(bar_width=None),
-                    TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-                    MofNCompleteColumn(),
-                    TextColumn("live [green]{task.fields[live]}"),
-                    TimeElapsedColumn(),
-                    TextColumn("eta"),
-                    TimeRemainingColumn(),
-                    console=Console(file=self.stream),
-                    transient=False,
-                )
-                self._rich.start()
-                self._task = self._rich.add_task(
-                    self.label, total=total, live=0)
-                return
-            except Exception:
-                self._rich = None
-                self.kind = "ascii"  # fall back if the rich API differs
+    # -- multi-target interface ------------------------------------------ #
+    def begin(self, n_targets):
+        self.s.begin(n_targets)
+
+    def start_target(self, idx, n, name, total):
+        self.s.begin_target(idx, n, name, total)
+        self._last_pct = -1
+        self._last_log = time.monotonic()
         if self.kind == "plain":
-            self.ui._emit(f"{self.label} started: {total:,} to check")
-
-    # -- per-target sub-progress (multi-target runs) --------------------- #
-    def start_target(self, index, count, name, total):
-        self._sub_desc = f"[{index}/{count}] {name}"
-        self._sub_done = 0
-        self._sub_total = total
-        if self.kind == "rich" and self._rich is not None:
-            if self._sub is not None:
-                self._rich.remove_task(self._sub)
-            self._sub = self._rich.add_task(
-                "  " + self._sub_desc, total=total, live=0)
-        elif self.kind == "plain":
-            self.ui._emit(f"{self._sub_desc}: scanning {total:,} candidates")
+            self.ui._emit(f"[{idx}/{n}] {name}: scanning {total:,} candidates")
 
     def update_target(self, done, live):
-        self._sub_done = done
-        if self.kind == "rich" and self._rich is not None and self._sub is not None:
-            self._rich.update(self._sub, completed=done, live=live)
-        elif self.kind == "ascii":
-            self._draw_bar(done, live, self._sub_total, self._sub_desc)
+        self.s.set_done(done, live)
+        self._tick()
 
-    def finish_target(self, done, live):
-        if self.kind == "rich" and self._rich is not None and self._sub is not None:
-            self._rich.update(self._sub, completed=self._sub_total, live=live)
-            self._rich.remove_task(self._sub)
-            self._sub = None
-        elif self.kind == "ascii":
-            self.stream.write("\r\033[K")   # clear the sub bar line
-            self.stream.flush()
+    def found(self, perm):
+        self.s.found(perm)
 
-    def advance_overall(self, done, live):
-        """Advance the overall bar by an already-scanned target."""
-        if self.kind == "rich" and self._rich is not None:
-            self._rich.update(self._task, completed=done, live=live)
-        elif self.kind == "ascii":
-            self._draw_bar(done, live, self.total, self.label)
-        else:
-            self._emit_line(done, live)
+    def set_counts(self, wild, lame, unresolved):
+        self.s.wild, self.s.lame, self.s.unres = wild, lame, unresolved
 
-    def update(self, done, live):
+    def target_done(self, info):
+        self.s.end_target()
         if self.kind == "none":
             return
-        if self.kind == "rich" and self._rich is not None:
-            self._rich.update(self._task, completed=done, live=live)
-        elif self.kind == "ascii":
-            self._draw_bar(done, live, self.total, self.label)
-        else:  # plain
-            self._emit_line(done, live)
+        self._clear_bar()
+        self.ui._emit(_target_done_line(self.ui, info, self.s.n_targets))
+
+    # -- single-pool interface (also called from Scanner / run_scan) ----- #
+    def start(self, total):
+        if self.s.in_target:
+            self.s.cur_total = total        # repeated start: just resize
+            return
+        self.s.begin_target(1, 1, self.label, total)
+        if self.kind == "plain":
+            self.ui._emit(f"{self.label}: {total:,} candidates to check")
+
+    def update(self, done, live):
+        self.s.set_done(done, live)
+        self._tick()
 
     def finish(self, done, live):
-        if self.kind == "rich" and self._rich is not None:
-            self._rich.update(self._task, completed=done, live=live)
-            self._rich.stop()
-            self._rich = None
-        elif self.kind == "ascii":
-            self._draw_bar(done, live, self.total, self.label)
-            self.stream.write("\n")
-            self.stream.flush()
-        elif self.kind == "plain":
-            self._emit_line(done, live, force=True, tag="done")
+        self.s.set_done(done, live)
+        if self.kind == "plain":
+            self._log_status(force=True)
+        self._clear_bar()
 
-    # -- ASCII terminal bar ---------------------------------------------- #
-    def _draw_bar(self, done, live, total, label):
+    def close(self):
+        self._clear_bar()
+
+    # -- rendering -------------------------------------------------------- #
+    def _tick(self):
+        if self.kind == "ascii":
+            now = time.monotonic()
+            if now - self._last_draw >= 0.1:
+                self._last_draw = now
+                self._draw_bar()
+        elif self.kind == "plain":
+            self._log_status()
+
+    def _clear_bar(self):
+        if self._bar_shown:
+            self.stream.write("\r\033[K")
+            self.stream.flush()
+            self._bar_shown = False
+
+    def _draw_bar(self):
+        s = self.s
         cols = shutil.get_terminal_size((80, 24)).columns
-        elapsed = time.monotonic() - self.start_t
-        rate = done / elapsed if elapsed > 0 else 0.0
-        eta = (total - done) / rate if rate > 0 and total else 0.0
-        frac = done / total if total else 1.0
-        stats = (f" {frac * 100:3.0f}% {done:,}/{total:,} "
-                 f"live {live} {rate:5.0f}/s eta {self._fmt(eta)}")
-        # size the bar to whatever width is left
-        width = max(10, min(40, cols - len(label) - len(stats) - 6))
+        frac = s.cur_done / s.cur_total if s.cur_total else 1.0
+        eta = s.cur_eta()
+        head = (f"[{s.cur_idx}/{s.n_targets}] " if s.n_targets > 1 else "") \
+            + s.cur_name
+        stats = (f" {frac * 100:3.0f}% {_human(s.cur_done)}/"
+                 f"{_human(s.cur_total)} live {s.live_all} "
+                 f"{s.cur_rate():,.0f}/s eta "
+                 f"{_fmt_dur(eta) if eta is not None else '--:--'}")
+        width = max(10, min(40, cols - len(head) - len(stats) - 4))
         filled = int(width * frac)
         bar = ("█" * filled + "░" * (width - filled)) if self.ui.color \
             else ("#" * filled + "." * (width - filled))
-        head = self.ui.c(label, "bold", "blue")
-        bar = self.ui.c(bar, "cyan")
-        self.stream.write(f"\r\033[K{head} {bar}{stats}")
+        self.stream.write(f"\r\033[K{self.ui.c(head, 'bold', 'blue')} "
+                          f"{self.ui.c(bar, 'cyan')}{stats}")
         self.stream.flush()
+        self._bar_shown = True
 
-    # -- file / nohup log lines (throttled) ------------------------------ #
-    def _emit_line(self, done, live, force=False, tag=None):
+    def _log_status(self, force=False):
+        s = self.s
         now = time.monotonic()
-        pct = int(done / self.total * 100) if self.total else 100
-        if not force and pct < self.last_pct + 5 and (now - self.last_emit) < 15:
+        pct = int(s.cur_done / s.cur_total * 100) if s.cur_total else 100
+        since = now - self._last_log
+        if not force and not ((pct >= self._last_pct + 10 and since >= 15)
+                              or since >= 60):
             return
-        self.last_pct = pct
-        self.last_emit = now
-        elapsed = self._fmt(now - self.start_t)
-        rate = done / (now - self.start_t) if now > self.start_t else 0.0
-        eta = self._fmt((self.total - done) / rate) if rate > 0 else "?"
-        label = "scan done" if tag == "done" else self.label
-        self.ui._emit(f"{label} {pct:3d}%  {done:,}/{self.total:,}  "
-                      f"live {live}  {rate:.0f}/s  eta {eta}")
+        self._last_pct, self._last_log = pct, now
+        eta = s.cur_eta()
+        head = (f"[{s.cur_idx}/{s.n_targets}] " if s.n_targets > 1 else "") \
+            + s.cur_name
+        line = (f"{head}: {pct:3d}%  {s.cur_done:,}/{s.cur_total:,}  "
+                f"live {s.cur_live}  {s.cur_rate():,.0f}/s  "
+                f"eta {_fmt_dur(eta) if eta is not None else '?'}")
+        if s.n_targets > 1:
+            oeta = s.overall_eta()
+            line += (f"  | run: {s.live_all} live, "
+                     f"~{_fmt_dur(oeta) if oeta is not None else '?'} left")
+        if s.recent:
+            line += f"  | latest: {s.recent[0][1]}"
+        self.ui._emit(line)
+
+
+def _target_done_line(ui, info, n):
+    """One line per finished target, shared by all renderers (ANSI styled)."""
+    lv = info["live"]
+    head = f"[{info['idx']}/{n}]"
+    top = info.get("top")
+    parts = [f"{ui.c('done', 'green')} {ui.c(head, 'grey')} "
+             f"{ui.c(info['name'], 'bold')}",
+             ui.c(f"{lv} live", "green" if lv else "grey"),
+             f"{info['candidates']:,} checked"]
+    if info.get("secs") is not None:
+        rate = info["candidates"] / info["secs"] if info["secs"] > 0 else 0
+        parts.append(f"{_fmt_dur(info['secs'])} ({rate:,.0f}/s)")
+    if top is not None:
+        col = "red" if top.risk >= 70 else "yellow" if top.risk >= 45 else "grey"
+        parts.append(f"top {ui.c(top.ascii, col)} ({top.risk})")
+    return "  ".join(parts)
+
+
+class Dashboard(Progress):
+    """Live rich dashboard (terminal + `rich`): overall and per-target bars,
+    throughput / memory / DNS-health counters, and a feed of recent finds.
+
+    All terminal output while the dashboard is up goes through ONE pump
+    thread: other code only queues lines (via print()). Python's text stream
+    is not thread-safe, and letting the scan thread and a refresh thread both
+    write lost bytes, which made the dashboard erase lines above itself."""
+
+    def __init__(self, ui, label="scanning"):
+        super().__init__(mode="auto", ui=ui, label=label)
+        self.kind = "rich"
+        self.console = Console(file=ui.stream, highlight=False)
+        self.live = None
+        self._pending = collections.deque()
+        self._stop = threading.Event()
+        self._pump_thread = None
+
+    # queued output: called by UI._emit / UI.print_rich while live
+    def print(self, renderable):
+        self._pending.append(renderable)
+
+    def _flush(self):
+        while self._pending:
+            self.console.print(self._pending.popleft())
+        if self.live is not None:
+            self.live.refresh()
+
+    def _pump(self):
+        while not self._stop.wait(0.25):
+            try:
+                self._flush()
+            except Exception:
+                pass            # never let a render glitch kill the scan
+
+    def _ensure_live(self):
+        if self.live is None:
+            from rich.live import Live
+            self.live = Live(self, console=self.console, auto_refresh=False,
+                             transient=True, redirect_stdout=False,
+                             redirect_stderr=False)
+            self.live.start()
+            self.ui.live_console = self
+            self._stop.clear()
+            self._pump_thread = threading.Thread(target=self._pump,
+                                                 name="twistr-ui", daemon=True)
+            self._pump_thread.start()
+
+    def begin(self, n_targets):
+        super().begin(n_targets)
+        self._ensure_live()
+
+    def start_target(self, idx, n, name, total):
+        self.s.begin_target(idx, n, name, total)
+        self._ensure_live()
+
+    def update_target(self, done, live):
+        self.s.set_done(done, live)
+
+    def target_done(self, info):
+        self.s.end_target()
+        self.ui._emit(_target_done_line(self.ui, info, self.s.n_targets))
+
+    def start(self, total):
+        if self.s.in_target:
+            self.s.cur_total = total
+            return
+        self.s.begin_target(1, 1, self.label, total)
+        self._ensure_live()
+
+    def update(self, done, live):
+        self.s.set_done(done, live)
+
+    def finish(self, done, live):
+        self.s.set_done(done, live)
+
+    def close(self):
+        if self.live is None:
+            return
+        self._stop.set()
+        if self._pump_thread is not None:
+            self._pump_thread.join(timeout=5)
+            self._pump_thread = None
+        try:
+            self._flush()           # queued lines, then one last frame
+            self.live.stop()        # transient: removes the dashboard
+        finally:
+            self.live = None
+            self.ui.live_console = None
+
+    # -- rendering (called from the pump thread via live.refresh) -------- #
+    def __rich__(self):
+        from rich.console import Group
+        from rich.panel import Panel
+        from rich.progress_bar import ProgressBar
+        from rich.table import Table
+        from rich.text import Text
+        s = self.s
+        grid = Table.grid(padding=(0, 1), expand=True)
+        grid.add_column(style="dim", width=8, no_wrap=True)
+        grid.add_column(ratio=1)
+        grid.add_column(justify="right", no_wrap=True)
+
+        if s.n_targets > 1:
+            oeta = s.overall_eta()
+            grid.add_row(
+                "overall",
+                ProgressBar(total=1.0, completed=s.overall_frac(),
+                            complete_style="blue", finished_style="green"),
+                Text.assemble((f"{s.targets_done}/{s.n_targets}", "bold"),
+                              " targets  ", (f"{s.live_all} live", "green"),
+                              "  eta ", (f"~{_fmt_dur(oeta)}" if oeta is not None
+                                         else "--", "cyan")))
+        frac = s.cur_done / s.cur_total if s.cur_total else 0.0
+        ceta = s.cur_eta()
+        name = (f"[{s.cur_idx}/{s.n_targets}] " if s.n_targets > 1 else "") \
+            + s.cur_name
+        grid.add_row("target", Text(name, style="bold"), "")
+        grid.add_row(
+            "",
+            ProgressBar(total=1.0, completed=frac, complete_style="cyan",
+                        finished_style="green"),
+            Text.assemble(f"{frac * 100:3.0f}%  ",
+                          f"{_human(s.cur_done)}/{_human(s.cur_total)}  ",
+                          (f"{s.cur_live} live", "green"),
+                          f"  {s.cur_rate():,.0f}/s  eta ",
+                          (_fmt_dur(ceta) if ceta is not None else "--",
+                           "cyan")))
+
+        rss = _rss_bytes()
+        stats = Text.assemble(
+            ("elapsed ", "dim"), _fmt_dur(s.elapsed()),
+            ("   checked ", "dim"), _human(s.done_all),
+            ("   avg ", "dim"), f"{s.rate():,.0f}/s",
+            ("   mem ", "dim"), f"{rss / 2**30:.1f} GB" if rss else "?",
+            ("   wildcard ", "dim"), str(s.wild),
+            ("   lame ", "dim"), str(s.lame),
+            ("   unresolved ", "dim"),
+            (str(s.unres), "yellow" if s.unres else ""))
+
+        finds = Table.grid(padding=(0, 2))
+        finds.add_column(justify="right", no_wrap=True)
+        finds.add_column(no_wrap=True, overflow="ellipsis", max_width=40)
+        finds.add_column(style="dim", no_wrap=True, overflow="ellipsis",
+                         max_width=28)
+        finds.add_column(style="dim", no_wrap=True)
+        finds.add_column(style="dim", justify="right", no_wrap=True)
+        now = time.monotonic()
+        recent = s.recent_snapshot()
+        for risk, dom, tgt, fz, t in recent:
+            col = "red" if risk >= 70 else "yellow" if risk >= 45 else "green"
+            ago = now - t
+            age = f"{int(ago)}s ago" if ago < 120 else f"{int(ago // 60)}m ago"
+            finds.add_row(Text(str(risk), style=col), dom, tgt, fz, age)
+        body = [grid, Text(""), stats, Text("")]
+        body.append(Text("recent finds", style="bold"))
+        body.append(finds if recent else
+                    Text("  no live lookalikes yet", style="dim"))
+        return Panel(Group(*body), title="[bold]twistr[/bold] · scanning",
+                     title_align="left", border_style="blue", padding=(0, 1))
+
+
+_default_unraisablehook = sys.unraisablehook
+
+
+def _quiet_unraisablehook(unraisable):
+    exc = unraisable.exc_value
+    where = f"{unraisable.err_msg or ''} {unraisable.object!r}"
+    if (isinstance(exc, RuntimeError) and "Event loop is closed" in str(exc)
+            and ("cffi callback" in where or "_cb" in where)):
+        return
+    _default_unraisablehook(unraisable)
+
+
+sys.unraisablehook = _quiet_unraisablehook
+
+
+def make_progress(mode, ui, label="scanning"):
+    """Rich dashboard on a colour terminal with `rich`; otherwise Progress."""
+    if mode != "none" and mode != "plain" and ui.rich:
+        return Dashboard(ui, label=label)
+    return Progress(mode=mode, ui=ui, label=label)
 
 
 # --------------------------------------------------------------------------- #
@@ -1486,6 +1817,16 @@ class Scanner:
                 progress.finish(done, live)
             if session is not None:
                 await session.close()
+            # stop in-flight DNS queries while the loop is still running, so
+            # their callbacks don't fire into a closed loop (Ctrl-C, errors)
+            if self._resolver is not None:
+                try:
+                    self._resolver.cancel()
+                    closer = getattr(self._resolver, "close", None)
+                    if closer is not None and asyncio.iscoroutinefunction(closer):
+                        await asyncio.wait_for(closer(), 2)
+                except BaseException:
+                    pass
         return perms
 
 
@@ -2094,7 +2435,26 @@ def check_resolvers(nameservers, timeout=3.0):
     return asyncio.run(run())
 
 
-def _report_resolvers(results, stream=sys.stderr):
+def _report_resolvers(results, ui=None):
+    """Resolver health table: rich on a colour terminal, plain lines otherwise."""
+    ui = ui or UI()
+    if ui.rich:
+        from rich.table import Table
+        from rich.text import Text
+        t = Table(show_header=True, header_style="bold", box=None,
+                  padding=(0, 2))
+        for col in ("status", "resolver", "provider", "latency", "detail"):
+            t.add_column(col, justify="right" if col == "latency" else "left")
+        for ns, status, detail, lat in results:
+            tag, col = {"ok": ("ok", "green"), "dead": ("DEAD", "red"),
+                        "hijack": ("BAD", "red"),
+                        "error": ("ERR", "red")}.get(status, (status, "yellow"))
+            t.add_row(Text(tag, style=col), ns,
+                      _RESOLVER_NAMES.get(_ns_host(ns), "custom"),
+                      f"{lat:.0f} ms" if lat is not None else "-",
+                      Text(detail or "", style="dim"))
+        ui.print_rich(t)
+        return
     for ns, status, detail, lat in results:
         name = _RESOLVER_NAMES.get(_ns_host(ns), "")
         label = f"{ns} ({name})" if name else ns
@@ -2102,7 +2462,7 @@ def _report_resolvers(results, stream=sys.stderr):
         tag = {"ok": "ok  ", "dead": "DEAD", "hijack": "BAD ",
                "error": "ERR "}.get(status, status)
         extra = f"  {detail}" if detail else ""
-        print(f"  [{tag}] {label:40} {ms}{extra}", file=stream)
+        ui.line(f"  [{tag}] {label:40} {ms}{extra}")
 
 
 def _warn_missing():
@@ -2112,53 +2472,189 @@ def _warn_missing():
     if not _HAVE_TLDEXTRACT:
         missing.append("tldextract (using heuristic suffix splitting)")
     if not _HAVE_RICH:
-        missing.append("rich (plain table output)")
+        missing.append("rich (plain progress/summary)")
     if missing:
-        print("note: optional libs not found -> " + "; ".join(missing),
-              file=sys.stderr)
+        UI().note("optional libs not found -> " + "; ".join(missing))
+
+
+def _target_stats(perms, idx=None, secs=None):
+    """Per-target numbers for the summary table, from one target's results."""
+    cands = [p for p in perms if p.fuzzer != "original"]
+    reg = [p for p in cands if p.registered]
+    top = max(reg, key=lambda p: p.risk) if reg else None
+    name = perms[0].target if perms else "?"
+    return {"idx": idx, "name": name, "candidates": len(cands),
+            "live": len(reg), "high": sum(1 for p in reg if p.risk >= 70),
+            "top": top, "secs": secs}
+
+
+def _resolves_to(p):
+    if p.dns_a:
+        return p.dns_a[0]
+    if p.dns_aaaa:
+        return p.dns_aaaa[0]
+    if p.dns_cname:
+        return "cname " + p.dns_cname[0]
+    if p.dns_ns == ["!servfail"]:
+        return "lame (SERVFAIL)"
+    if p.dns_ns:
+        return "ns " + p.dns_ns[0]
+    return ""
 
 
 def _summarize(ui, perms, only_registered, ml, elapsed, total_generated,
-               live, wild, lame, unresolved, targets):
-    """Print a tidy end-of-run summary with the top-risk findings."""
+               live, wild, lame, unresolved, target_stats, out_path=None,
+               n_written=None):
+    """End-of-run summary: totals, risk mix, per-target table, findings by
+    fuzzer, and the top findings ranked by risk across all targets."""
     rows = _rows(perms, only_registered, ml)
+    reg = sorted((p for p in rows if p.registered),
+                 key=lambda p: (-p.risk, p.target, p.ascii))
+    hi = sum(1 for p in reg if p.risk >= 70)
+    med = sum(1 for p in reg if 45 <= p.risk < 70)
+    low = len(reg) - hi - med
+    rate = total_generated / elapsed if elapsed > 0 else 0
+    by_fuzzer = collections.Counter(p.fuzzer for p in reg).most_common(8)
+    multi = len(target_stats) > 1
+    top = reg[:15]
+    filt = [f"{wild} wildcard ignored" if wild else "",
+            f"{lame} lame counted" if lame else "",
+            f"{unresolved} unresolved" if unresolved else ""]
+    filt = " · ".join(x for x in filt if x)
+
+    if ui.rich:
+        from rich.console import Group
+        from rich.panel import Panel
+        from rich.table import Table
+        from rich.text import Text
+
+        grid = Table.grid(padding=(0, 2))
+        grid.add_column(style="dim", justify="right", no_wrap=True)
+        grid.add_column()
+        grid.add_row("registered", Text.assemble(
+            (f"{live:,}", "bold green" if live else "dim"), " lookalikes   ",
+            (f"{hi} high", "red"), " · ", (f"{med} medium", "yellow"),
+            " · ", (f"{low} low", "dim")))
+        grid.add_row("checked", f"{total_generated:,} candidates across "
+                     f"{len(target_stats)} target"
+                     f"{'s' if len(target_stats) != 1 else ''}")
+        grid.add_row("time", f"{_fmt_dur(elapsed)} · avg {rate:,.0f}/s")
+        if filt:
+            grid.add_row("dns", Text(filt, style="yellow" if unresolved
+                                     else "dim"))
+        if by_fuzzer:
+            grid.add_row("by fuzzer", " · ".join(f"{f} {n}"
+                                                for f, n in by_fuzzer))
+        if out_path:
+            grid.add_row("output", Text.assemble(
+                (out_path, "cyan"),
+                f"  ({n_written:,} domains)" if n_written is not None else ""))
+        parts = [grid]
+
+        if multi:
+            tt = Table(box=None, header_style="bold", padding=(0, 2),
+                       title="per target", title_justify="left",
+                       title_style="bold")
+            tt.add_column("target", no_wrap=True)
+            tt.add_column("checked", justify="right")
+            tt.add_column("live", justify="right")
+            tt.add_column("high", justify="right")
+            tt.add_column("time", justify="right")
+            tt.add_column("top find", no_wrap=True, overflow="ellipsis",
+                          max_width=40)
+            shown = target_stats if len(target_stats) <= 40 else sorted(
+                target_stats, key=lambda t: -t["live"])[:40]
+            for t in shown:
+                tp = t["top"]
+                tt.add_row(
+                    t["name"], f"{t['candidates']:,}",
+                    Text(str(t["live"]), style="green" if t["live"] else "dim"),
+                    Text(str(t["high"]), style="red" if t["high"] else "dim"),
+                    _fmt_dur(t["secs"]) if t["secs"] is not None else "-",
+                    Text(f"{tp.ascii} ({tp.risk})", style="dim") if tp else "")
+            parts += [Text(""), tt]
+            if len(target_stats) > 40:
+                parts.append(Text(f"  showing 40 of {len(target_stats)} "
+                                  f"targets (most live first)", style="dim"))
+
+        if top:
+            ft = Table(box=None, header_style="bold", padding=(0, 2),
+                       title="top findings", title_justify="left",
+                       title_style="bold")
+            ft.add_column("risk", justify="right")
+            ft.add_column("domain", no_wrap=True, overflow="ellipsis",
+                          max_width=42)
+            if multi:
+                ft.add_column("target", style="dim", no_wrap=True)
+            ft.add_column("fuzzer", style="dim", no_wrap=True)
+            ft.add_column("resolves to", style="dim", no_wrap=True,
+                          overflow="ellipsis", max_width=30)
+            for p in top:
+                col = "red" if p.risk >= 70 else "yellow" if p.risk >= 45 \
+                    else "green"
+                dom = p.ascii if p.ascii == p.domain else \
+                    f"{p.ascii} ({p.domain})"
+                row = [Text(str(p.risk), style=col), dom]
+                if multi:
+                    row.append(p.target)
+                row += [p.fuzzer, _resolves_to(p)]
+                ft.add_row(*row)
+            parts += [Text(""), ft]
+            if len(reg) > len(top):
+                parts.append(Text(f"  … and {len(reg) - len(top):,} more in "
+                                  f"the output", style="dim"))
+        elif not reg:
+            parts += [Text(""), Text("no registered lookalikes found",
+                                     style="dim")]
+        ui.print_rich(Panel(Group(*parts), title="[bold]results[/bold]",
+                            title_align="left",
+                            border_style="green" if live else "blue",
+                            padding=(0, 1)))
+        return len(rows)
+
+    # -- plain / log version ---------------------------------------------- #
     ui.line()
     ui.rule("results")
-    ui.item("targets", len(targets))
-    ui.item("checked", f"{total_generated:,}")
-    reg_style = "green" if live else None
-    ui.item("registered", live, reg_style if live else "grey")
-    if wild:
-        ui.item("wildcard", f"{wild} (ignored - parent-zone catch-all)", "grey")
-    if lame:
-        ui.item("lame NS", f"{lame} (broken nameservers, counted as live)",
-                "grey")
-    if unresolved:
-        ui.item("unresolved", f"{unresolved} (resolver dropped - see warning)",
-                "yellow")
-    ui.item("elapsed", Progress._fmt(elapsed))
-
-    top = rows[:12]
+    ui.item("registered", f"{live:,} lookalikes ({hi} high, {med} medium, "
+            f"{low} low)", "green" if live else "grey")
+    ui.item("checked", f"{total_generated:,} candidates across "
+            f"{len(target_stats)} target{'s' if len(target_stats) != 1 else ''}")
+    ui.item("time", f"{_fmt_dur(elapsed)} (avg {rate:,.0f}/s)")
+    if filt:
+        ui.item("dns", filt, "yellow" if unresolved else "grey")
+    if by_fuzzer:
+        ui.item("by fuzzer", ", ".join(f"{f} {n}" for f, n in by_fuzzer))
+    if out_path:
+        ui.item("output", out_path + (f" ({n_written:,} domains)"
+                                      if n_written is not None else ""), "cyan")
+    if multi:
+        ui.line()
+        w = max(len(t["name"]) for t in target_stats)
+        ui.line(ui.c(f"  {'target':<{w}}  {'checked':>11}  {'live':>5}  "
+                     f"{'high':>4}  {'time':>8}  top find", "bold"))
+        for t in target_stats:
+            tp = t["top"]
+            tm = _fmt_dur(t["secs"]) if t["secs"] is not None else "-"
+            ui.line(f"  {t['name']:<{w}}  {t['candidates']:>11,}  "
+                    f"{t['live']:>5}  {t['high']:>4}  {tm:>8}  "
+                    f"{(tp.ascii + ' (' + str(tp.risk) + ')') if tp else ''}")
     if top:
         ui.line()
-        hi = sum(1 for p in rows if p.risk >= 70)
-        med = sum(1 for p in rows if 45 <= p.risk < 70)
-        ui.line(f"  {ui.c('top findings', 'bold')}  "
-                f"({ui.c(str(hi) + ' high', 'red')}, "
-                f"{ui.c(str(med) + ' medium', 'yellow')} of {len(rows)})")
-        multi = len({p.target for p in rows}) > 1
+        ui.line(ui.c("  top findings", "bold"))
+        wd = max(len(p.ascii) for p in top)
+        wf = max(len(p.fuzzer) for p in top)
+        wt = max(len(p.target) for p in top)
         for p in top:
             col = "red" if p.risk >= 70 else "yellow" if p.risk >= 45 else "grey"
-            risk = ui.c(f"{p.risk:>3}", col)
-            dom = p.ascii if p.ascii == p.domain else f"{p.ascii} ({p.domain})"
-            tgt = ui.c(f"  {p.target}", "grey") if multi else ""
-            ui.line(f"  {risk}  {dom}{tgt}")
-        if len(rows) > len(top):
-            ui.line(ui.c(f"  ... and {len(rows) - len(top):,} more", "grey"))
-    else:
+            tgt = f"  {p.target:<{wt}}" if multi else ""
+            ui.line(f"  {ui.c(f'{p.risk:>3}', col)}  {p.ascii:<{wd}}  "
+                    f"{p.fuzzer:<{wf}}{tgt}  {_resolves_to(p)}")
+        if len(reg) > len(top):
+            ui.line(ui.c(f"  ... and {len(reg) - len(top):,} more in the "
+                         f"output", "grey"))
+    elif not reg:
         ui.line()
         ui.line(ui.c("  no registered lookalikes found", "grey"))
-
     return len(rows)
 
 
@@ -2184,10 +2680,12 @@ def main(argv=None):
             return 2
         ui.rule("resolver health")
         results = check_resolvers(ns_list, timeout=min(args.timeout, 5.0))
-        _report_resolvers(results)
+        _report_resolvers(results, ui)
         good = [r for r in results if r[1] == "ok"]
-        (ui.ok if len(good) == len(results) else ui.warn)(
-            f"{len(good)}/{len(results)} usable")
+        if len(good) == len(results):
+            ui.ok(f"{len(good)}/{len(results)} usable")
+        else:
+            ui.warn(f"{len(good)}/{len(results)} usable")
         return 0 if len(good) == len(results) else 1
 
     nameservers = None
@@ -2228,38 +2726,19 @@ def main(argv=None):
     do_favicon = args.favicon or args.all_checks
     do_rdap = args.rdap or args.all_checks
     do_mx = args.mx or args.all_checks
+    later_notes = []          # printed after the header
     if (do_web or do_rdap) and not _HAVE_AIOHTTP:
-        ui.warn("web/favicon/rdap checks need aiohttp (not installed); "
-                "skipping them")
+        later_notes.append(("warn", "web/favicon/rdap checks need aiohttp (not "
+                                    "installed); skipping them"))
     if do_web and not _HAVE_FUZZY:
-        ui.note("install ppdeep for homepage content-similarity scoring")
+        later_notes.append(("note", "install ppdeep for homepage "
+                                    "content-similarity scoring"))
 
     # generation guards: stop well before the OS OOM-killer fires (SIGKILL,
     # which we could not otherwise report), and honour an explicit cap
     avail = _avail_memory()
     mem_budget = int(avail * 0.80) if avail else 0
     max_cand = args.max_candidates
-
-    # header
-    if not quiet:
-        ui.rule("twistr")
-        ui.item("targets", len(targets) if len(targets) > 1 else targets[0])
-        checks = [n for n, on in (("web", do_web), ("favicon", do_favicon),
-                                  ("rdap", do_rdap), ("mx", do_mx),
-                                  ("ct", args.ct)) if on]
-        ui.item("checks", ", ".join(checks) if checks else "dns only")
-        if selected:
-            ui.item("fuzzers", ", ".join(selected))
-        if dictionary:
-            ui.item("dictionary", f"{len(dictionary):,} words")
-        if max_cand:
-            ui.item("max/target", f"{max_cand:,}")
-
-    if dictionary and len(dictionary) * 4 > 500_000:
-        cap = (f", or at --max-candidates ({max_cand:,})" if max_cand else "")
-        ui.note(f"dictionary is large (~{len(dictionary) * 4:,} candidates per "
-                f"target); capping generation near ~{mem_budget // 2**30} GB "
-                f"RAM{cap}")
 
     # validate targets cheaply (constructing a fuzzer parses/splits but does
     # not generate), so an invalid target is reported before any heavy work
@@ -2279,18 +2758,19 @@ def main(argv=None):
     ml = args.min_length
     out_path = _resolve_output_path(args, targets)
 
-    def gen(target):
-        fz = DomainFuzzer(target, dictionary=dictionary, tlds=tlds,
-                          idn_policy=not args.all_idn)
-        tp = fz.generate(selected, max_candidates=max_cand,
-                         mem_budget=mem_budget)
-        if fz.stopped_reason:
-            ui.note(f"{fz.original}: generation stopped early - "
-                    f"{fz.stopped_reason}; scanning the "
-                    f"{_generated_count(tp):,} generated so far")
-        elif fz.trim_note and not quiet:
-            ui.note(f"{fz.original}: {fz.trim_note}")
-        return fz, tp
+    # resolver health, before the header so the header can report it
+    res_results = None
+    if not args.no_scan and nameservers:
+        res_results = check_resolvers(nameservers,
+                                      timeout=min(args.timeout, 5.0))
+        good = [r[0] for r in res_results if r[1] == "ok"]
+        if not good:
+            if not quiet:
+                _report_resolvers(res_results, ui)
+            ui.error("none of the --nameservers answered correctly; check your "
+                     "network or run --check-resolvers")
+            return 2
+        nameservers = good
 
     # set up live streaming to the output file, if requested and supported
     writer = None
@@ -2298,21 +2778,105 @@ def main(argv=None):
                and args.format in ("domains", "csv"))
     if args.live and not live_ok:
         if not out_path:
-            ui.note("--live needs an output file (-o / --outdir / "
-                    "--timestamp); ignoring --live")
+            later_notes.append(("note", "--live needs an output file (-o / "
+                                        "--outdir / --timestamp); ignoring "
+                                        "--live"))
         elif args.no_scan:
-            ui.note("--live has no effect with --no-scan")
+            later_notes.append(("note", "--live has no effect with --no-scan"))
         else:
-            ui.note(f"--live supports domains/csv only; {args.format} is "
-                    "written at the end")
+            later_notes.append(("note", f"--live supports domains/csv only; "
+                                        f"{args.format} is written at the end"))
     if live_ok:
         try:
             writer = LiveWriter(out_path, args.format, args.registered, ml)
         except OSError as e:
             ui.error(f"cannot open {out_path} for live output: {e}")
             return 2
-        if not quiet:
-            ui.item("live file", out_path, "cyan")
+
+    # ---- header ----------------------------------------------------------- #
+    if not quiet:
+        rows = []
+        shown = ", ".join(targets[:3])
+        more = f", +{len(targets) - 3} more" if len(targets) > 3 else ""
+        rows.append(("targets", f"{len(targets)}  ({shown}{more})"
+                     if len(targets) > 1 else targets[0], "bold"))
+        if args.input and args.input != "-":
+            rows.append(("input", args.input, None))
+        rows.append(("fuzzers", ", ".join(selected) if selected
+                     else f"all {len(DomainFuzzer._ALL)}", None))
+        if dictionary:
+            rows.append(("dictionary", f"{len(dictionary):,} words · "
+                         f"{os.path.basename(args.dictionary)}", None))
+        if tlds:
+            rows.append(("tld list", f"{len(tlds):,} TLDs · "
+                         f"{os.path.basename(args.tld_file)}", None))
+        if max_cand:
+            samp = " (dictionary sampled evenly)" if dictionary and \
+                len(dictionary) * 4 > max_cand else ""
+            rows.append(("per target", f"max {max_cand:,} candidates{samp}",
+                         None))
+        elif dictionary and len(dictionary) * 4 > 500_000:
+            rows.append(("per target",
+                         f"unlimited: up to ~{_human(len(dictionary) * 4)} "
+                         f"candidates each (memory guard "
+                         f"~{mem_budget // 2**30} GB) - consider "
+                         f"--max-candidates", "yellow"))
+        checks = ["dns (A/AAAA/NS" + ("/MX" if do_mx else "") + ")"]
+        checks += [n for n, on in (("web", do_web), ("favicon", do_favicon),
+                                   ("rdap", do_rdap), ("ct", args.ct)) if on]
+        rows.append(("checks", ", ".join(checks), None))
+        if args.no_scan:
+            rows.append(("mode", "generate only (--no-scan)", None))
+        elif res_results is not None:
+            good_n = sum(1 for r in res_results if r[1] == "ok")
+            provs = []
+            for ns in nameservers:
+                p = _RESOLVER_NAMES.get(_ns_host(ns), "custom")
+                for suffix in (" unsecured", " Sandbox", " non-filtering",
+                               " unfiltered"):
+                    p = p.replace(suffix, "")
+                if p not in provs:
+                    provs.append(p)
+            rows.append(("resolvers", f"{good_n}/{len(res_results)} healthy · "
+                         + ", ".join(provs),
+                         "green" if good_n == len(res_results) else "yellow"))
+        elif _HAVE_AIODNS:
+            rows.append(("resolvers", "system resolver (may filter - consider "
+                         "--nameservers unfiltered)", "yellow"))
+        else:
+            rows.append(("resolvers", "system resolver (aiodns not installed)",
+                         "yellow"))
+        if not args.no_scan:
+            rows.append(("concurrency", f"{args.concurrency}" +
+                         (f" × {args.processes} processes"
+                          if args.processes > 1 else ""), None))
+        if out_path:
+            rows.append(("output", f"{args.format} → {out_path}"
+                         + ("  (live)" if writer else ""), "cyan"))
+        else:
+            rows.append(("output", f"{args.format} → stdout", None))
+        rows.append(("started", time.strftime("%Y-%m-%d %H:%M:%S"), None))
+        ui.header("twistr", rows)
+
+    if res_results is not None:
+        for ns, status, detail, _lat in res_results:
+            if status != "ok":
+                nm = _RESOLVER_NAMES.get(_ns_host(ns), "")
+                lbl = f"{ns} ({nm})" if nm else ns
+                ui.warn(f"dropped {lbl}: {detail}")
+    for kind, text in later_notes:
+        (ui.warn if kind == "warn" else ui.note)(text)
+
+    def gen(target):
+        fz = DomainFuzzer(target, dictionary=dictionary, tlds=tlds,
+                          idn_policy=not args.all_idn)
+        tp = fz.generate(selected, max_candidates=max_cand,
+                         mem_budget=mem_budget)
+        if fz.stopped_reason:
+            ui.warn(f"{fz.original}: generation stopped early - "
+                    f"{fz.stopped_reason}; scanning the "
+                    f"{_generated_count(tp):,} generated so far")
+        return fz, tp
 
     # Stream target-by-target when there are several: each is generated, scanned
     # and then reduced to just the rows we'll output, so memory stays flat and a
@@ -2323,6 +2887,7 @@ def main(argv=None):
                   and len(targets) > 1)
 
     live = lame = wild = unresolved = total_generated = 0
+    target_stats = []
 
     def tally(tp):
         nonlocal live, lame, wild, unresolved, total_generated
@@ -2341,44 +2906,16 @@ def main(argv=None):
 
     prog_mode = "none" if quiet else args.progress
     t0 = time.monotonic()
+    progress = None
+    perms = []
 
     try:
         if not args.no_scan:
-            if nameservers:
-                results = check_resolvers(nameservers,
-                                          timeout=min(args.timeout, 5.0))
-                good = [r[0] for r in results if r[1] == "ok"]
-                bad = [r for r in results if r[1] != "ok"]
-                healthy = f"{len(good)}/{len(results)} resolvers healthy"
-                if not quiet:
-                    if bad:
-                        ui.item("resolvers", healthy, "yellow")
-                    else:
-                        ui.item("resolvers", healthy, "green")
-                if bad:
-                    for ns, status, detail, _lat in bad:
-                        nm = _RESOLVER_NAMES.get(_ns_host(ns), "")
-                        lbl = f"{ns} ({nm})" if nm else ns
-                        ui.warn(f"dropped {lbl}: {detail}")
-                if not good:
-                    ui.error("none of the --nameservers answered correctly; "
-                             "check your network or run --check-resolvers")
-                    if writer:
-                        writer.close()
-                    return 2
-                nameservers = good
-            elif _HAVE_AIODNS and not quiet:
-                ui.note("using the system resolver - if it filters (router/ISP "
-                        "threat or content filtering), blocked lookalikes will "
-                        "look unregistered; consider --nameservers unfiltered")
-
-            progress = Progress(mode=prog_mode, ui=ui)
-
+            if not quiet:
+                ui.line()
             if per_target:
-                if not quiet:
-                    ui.line()
-                perms = []
-                progress.start(len(targets))     # overall bar counts targets
+                progress = make_progress(prog_mode, ui)
+                progress.begin(len(targets))
                 for idx, target in enumerate(targets, 1):
                     try:
                         fz, tp = gen(target)
@@ -2395,30 +2932,27 @@ def main(argv=None):
                         _tc["done"] += 1
                         if p.registered:
                             _tc["live"] += 1
+                            progress.found(p)
                         if writer:
                             writer.feed(p)
                         progress.update_target(_tc["done"], _tc["live"])
 
+                    t_start = time.monotonic()
                     run_scan(tp, processes=1, concurrency=args.concurrency,
                              timeout=args.timeout, nameservers=nameservers,
                              do_web=do_web, do_rdap=do_rdap,
                              do_favicon=do_favicon, do_mx=do_mx, progress=None,
                              on_result=_cb)
                     tally(tp)
-                    lv = tcount["live"]
+                    progress.set_counts(wild, lame, unresolved)
+                    st = _target_stats(tp, idx=idx,
+                                       secs=time.monotonic() - t_start)
+                    target_stats.append(st)
                     perms.extend(p for p in tp
                                  if _passes(p, args.registered, ml))
-                    progress.finish_target(tcount["done"], lv)
-                    progress.advance_overall(idx, live)
-                    if not quiet:
-                        col = "green" if lv else "grey"
-                        ui.line(f"  {ui.c(f'[{idx}/{len(targets)}]', 'grey')} "
-                                f"{fz.original}: {ui.c(str(lv) + ' live', col)} "
-                                f"/ {_generated_count(tp):,}")
+                    progress.target_done(st)
                     del tp
-                progress.finish(len(targets), live)
             else:
-                perms = []
                 for target in targets:
                     try:
                         fz, tp = gen(target)
@@ -2426,9 +2960,6 @@ def main(argv=None):
                         ui.error(f"{e} (use --list-fuzzers to see valid names)")
                         return 2
                     perms += tp
-                    if not quiet:
-                        ui.item("generated",
-                                f"{_generated_count(tp):,} for {fz.original}")
                 if not perms:
                     ui.error("no valid targets to scan")
                     return 2
@@ -2445,23 +2976,40 @@ def main(argv=None):
                         added += len(found)
                     ui.note(f"ct: added {added} domains from Certificate "
                             f"Transparency logs")
+                label = targets[0] if len(targets) == 1 else \
+                    f"{len(targets)} targets"
+                progress = make_progress(prog_mode, ui, label=label)
                 progress.start(_generated_count(perms))
+
+                def _res(p):
+                    if writer:
+                        writer.feed(p)
+                    if p.registered and p.fuzzer != "original":
+                        progress.found(p)
+
+                t_start = time.monotonic()
                 perms = run_scan(perms, processes=max(1, args.processes),
                                  concurrency=args.concurrency,
                                  timeout=args.timeout, nameservers=nameservers,
                                  do_web=do_web, do_rdap=do_rdap,
                                  do_favicon=do_favicon, do_mx=do_mx,
-                                 progress=progress,
-                                 on_result=writer.feed if writer else None)
+                                 progress=progress, on_result=_res)
                 tally(perms)
-
+                secs = time.monotonic() - t_start
+                groups = collections.OrderedDict()
+                for p in perms:
+                    groups.setdefault(p.target, []).append(p)
+                for i, (_tgt, grp) in enumerate(groups.items(), 1):
+                    target_stats.append(_target_stats(
+                        grp, idx=i, secs=secs if len(groups) == 1 else None))
+            if progress:
+                progress.close()
             if unresolved:
                 ui.warn(f"{unresolved} domains could not be resolved even after "
                         f"retry rounds; results may be incomplete. Try "
                         f"--nameservers unfiltered (spreads load over 6 "
                         f"providers), a local resolver, or lower --concurrency")
         else:
-            perms = []
             for target in targets:
                 try:
                     fz, tp = gen(target)
@@ -2477,16 +3025,36 @@ def main(argv=None):
                 return 2
             for p in perms:
                 p.risk = score(p)
+    except KeyboardInterrupt:
+        if progress:
+            progress.close()
+        if writer:
+            writer.close()
+        done_n = len(target_stats)
+        msg = f"interrupted after {_fmt_dur(time.monotonic() - t0)}"
+        if per_target:
+            msg += f" ({done_n}/{len(targets)} targets finished)"
+        if writer:
+            msg += f"; matches found so far are in {out_path}"
+        ui.warn(msg)
+        return 130
     except MemoryError:
+        if progress:
+            progress.close()
         ui.error("ran out of memory. Reduce the --dictionary size, scan fewer "
                  "targets at once, or set --max-candidates. (twistr tries to "
                  "self-limit, but a hard cap is safest for very large runs.)")
         if writer:
             writer.close()
         return 2
+    finally:
+        if progress:
+            progress.close()
 
     if writer:
         writer.close()
+
+    elapsed = time.monotonic() - t0
 
     # final output: for a live run this atomically rewrites the streamed file,
     # risk-sorted, so the finished file is ordered worst-first
@@ -2501,28 +3069,25 @@ def main(argv=None):
             out = render_csv(perms, args.registered, ml)  # table isn't a file
         else:
             if not args.no_scan and not quiet:
-                _summarize(ui, perms, args.registered, ml,
-                           time.monotonic() - t0, total_generated, live, wild,
-                           lame, unresolved, targets)
+                _summarize(ui, perms, args.registered, ml, elapsed,
+                           total_generated, live, wild, lame, unresolved,
+                           target_stats)
                 ui.line()
             render_table(perms, args.registered, ml)
             return 0
 
-    n_rows = None
+    n_written = len(_rows(perms, args.registered, ml))
     if out_path:
         _atomic_write(out_path, out)
     else:
         print(out, end="" if args.format == "domains" else "\n")
 
     if not args.no_scan and not quiet:
-        n_rows = _summarize(ui, perms, args.registered, ml,
-                            time.monotonic() - t0, total_generated, live, wild,
-                            lame, unresolved, targets)
-    if out_path and not quiet:
-        shown = n_rows if n_rows is not None else \
-            len(_rows(perms, args.registered, ml))
-        ui.line()
-        ui.ok(f"wrote {shown:,} domains -> {out_path}")
+        _summarize(ui, perms, args.registered, ml, elapsed, total_generated,
+                   live, wild, lame, unresolved, target_stats,
+                   out_path=out_path, n_written=n_written if out_path else None)
+    elif out_path and not quiet:
+        ui.ok(f"wrote {n_written:,} domains -> {out_path}")
     return 0
 
 
