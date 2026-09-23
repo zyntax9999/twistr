@@ -40,6 +40,7 @@ background runs.
   - [Performance tuning](#performance-tuning)
   - [Piping and automation](#piping-and-automation)
   - [A complete brand-monitoring workflow](#a-complete-brand-monitoring-workflow)
+- [Choosing resolvers](#choosing-resolvers)
 - [Performance notes](#performance-notes)
 - [Troubleshooting](#troubleshooting)
 - [Exit codes](#exit-codes)
@@ -165,7 +166,7 @@ python twistr.py [domains...] [options]
 | `--dictionary FILE` | Wordlist for the `dictionary` (combosquatting) fuzzer, one word per line. Replaces the built-in list. |
 | `--tld-file FILE` | Wordlist of TLDs for the `tld-swap` fuzzer, one per line. Replaces the built-in list. |
 | `--all-idn` | Also generate IDN lookalikes using characters the TLD's registry doesn't accept (off by default, since those can't be registered there). |
-| `--max-candidates N` | Stop generating a target's permutations after N candidates (0 = unlimited). Guards against giant dictionaries; twistr also self-limits as it approaches available memory. |
+| `--max-candidates N` | Cap each target at N candidates (0 = unlimited). Every other fuzzer runs in full first; the `dictionary` fuzzer gets the remaining budget and, if trimmed, samples words evenly across the whole list (so a sorted dictionary isn't cut to the start of the alphabet). twistr also self-limits as it approaches available memory. |
 | `--no-scan` | Only generate candidates; don't query DNS. Great for building lists or counting. |
 
 ### Detection (what to check on each candidate)
@@ -188,7 +189,9 @@ python twistr.py [domains...] [options]
 | `--concurrency N` | `64` | Max in-flight lookups per process. I/O-bound, so this can be high (200–1000 with good resolvers). |
 | `-P, --processes N` | `1` | Split the scan across N worker processes to use multiple cores. Helps most with `--web`/`ppdeep` or very high concurrency. |
 | `--timeout SECS` | `5.0` | Per-query DNS timeout. |
-| `--nameservers LIST` | *(system)* | Comma-separated resolvers, e.g. `1.1.1.1,8.8.4.4` (needs `aiodns`). Multiple resolvers are load-balanced. |
+| `--nameservers LIST` | *(system)* | Comma-separated resolvers, e.g. `1.1.1.1,8.8.4.4` or `127.0.0.1:5335` (needs `aiodns`). The word `unfiltered` expands to a vetted set of 12 unfiltered public resolvers. Multiple resolvers are load-balanced and health-checked at start. Known *filtering* resolvers are refused. See [Choosing resolvers](#choosing-resolvers). |
+| `--allow-filtering-resolvers` | | Allow resolvers that block domains (not recommended: blocked lookalikes look unregistered). |
+| `--check-resolvers` | | Health-check your `--nameservers` (or the `unfiltered` preset) and exit. |
 
 ### Output
 
@@ -576,6 +579,110 @@ if [ -n "${PREV:-}" ]; then
     fi
 fi
 ```
+
+---
+
+## Choosing resolvers
+
+The resolver you use decides what twistr can see. Two rules matter.
+
+**1. Never use a filtering resolver.** Many public resolvers block known
+phishing and malware domains by default, which are exactly the domains twistr
+is looking for. Depending on the provider, a blocked name comes back as
+NXDOMAIN (so twistr concludes it isn't registered) or as a sinkhole or
+block-page address (a fake answer). Either way the scan is silently wrong.
+twistr refuses known filtering resolvers and tells you the unfiltered
+alternative:
+
+| Filtering (refused) | Unfiltered alternative |
+|---|---|
+| Quad9 `9.9.9.9`, `149.112.112.112`, `9.9.9.11` | Quad9 unsecured `9.9.9.10`, `149.112.112.10` |
+| Cloudflare for Families `1.1.1.2`, `1.1.1.3` (and `1.0.0.x`) | Cloudflare `1.1.1.1`, `1.0.0.1` |
+| OpenDNS `208.67.222.222`, `208.67.220.220` (blocks phishing by default), FamilyShield `.123` | OpenDNS Sandbox `208.67.222.2`, `208.67.220.2` |
+| AdGuard default `94.140.14.14`, Family `94.140.14.15` | AdGuard non-filtering `94.140.14.140`, `94.140.14.141` |
+| Control D `76.76.2.1`-`.4`, `76.76.10.1`-`.4` | Control D unfiltered `76.76.2.0`, `76.76.10.0` |
+| CleanBrowsing (all), Yandex Safe/Family, DNS4EU filtering services | Cloudflare or Google |
+
+This list covers well-known services only. Your **router or ISP** resolver may
+also filter (for example, content or threat filtering enabled on the router),
+and twistr can't detect that. That's why it prints a note when you run without
+`--nameservers`.
+
+**2. Spread the load.** Public resolvers rate-limit per client IP. A big scan
+sends thousands of queries per second, so a single provider will start dropping
+queries. `--nameservers unfiltered` spreads the load over 12 resolvers from 6
+independent providers (Cloudflare, Google, Quad9 unsecured, OpenDNS Sandbox,
+AdGuard non-filtering, Control D unfiltered):
+
+```bash
+python twistr.py -i brands.txt -r --nameservers unfiltered --concurrency 300
+```
+
+At start, twistr health-checks every resolver. Each must answer a real name and
+return NXDOMAIN for a random non-existent one; any that are dead, or that
+rewrite non-existent names into fake addresses, are dropped:
+
+```
+resolvers: 11/12 healthy
+  dropping:
+  [DEAD] 208.67.220.2 (OpenDNS Sandbox)      -   no answer for example.com
+```
+
+You can run the same check on its own:
+
+```bash
+python twistr.py --check-resolvers --nameservers unfiltered
+python twistr.py --check-resolvers --nameservers 127.0.0.1:5335
+```
+
+### Best option: your own resolver (Unbound)
+
+For large or regular scans, run a local recursive resolver on the scanning
+machine. It asks the authoritative servers directly, so there's **no third
+party that could filter, no per-client rate limit, and no one else's cache**
+between you and the answer. On Ubuntu/Debian:
+
+```bash
+sudo apt install unbound dnsutils
+
+sudo tee /etc/unbound/unbound.conf.d/twistr.conf >/dev/null <<'EOF'
+server:
+    interface: 127.0.0.1
+    port: 5335
+    access-control: 127.0.0.0/8 allow
+    num-threads: 4
+    so-reuseport: yes
+    outgoing-range: 8192
+    num-queries-per-thread: 4096
+    msg-cache-size: 128m
+    rrset-cache-size: 256m
+    so-rcvbuf: 4m
+    so-sndbuf: 4m
+    prefetch: no
+    qname-minimisation: yes
+    harden-glue: yes
+    edns-buffer-size: 1232
+EOF
+
+sudo unbound-checkconf && sudo systemctl restart unbound
+dig @127.0.0.1 -p 5335 example.com +short          # should print an IP
+python twistr.py --check-resolvers --nameservers 127.0.0.1:5335
+```
+
+Then scan with it, alone or together with the public preset:
+
+```bash
+python twistr.py -i brands.txt -r --nameservers 127.0.0.1:5335 --concurrency 400
+python twistr.py -i brands.txt -r --nameservers 127.0.0.1:5335,unfiltered
+```
+
+Notes: port 5335 avoids clashing with anything already on port 53. Set
+`num-threads` to your core count. If Unbound logs *"cannot increase max open
+fds"*, lower `outgoing-range` to `4096`. If it warns about socket buffers, raise
+`net.core.rmem_max` / `net.core.wmem_max` with `sysctl`, or lower
+`so-rcvbuf`/`so-sndbuf`. With Ubuntu's default package config Unbound also
+validates DNSSEC; a domain with broken DNSSEC then shows up as a lame delegation
+(`!servfail`), which twistr still counts as registered.
 
 ---
 
