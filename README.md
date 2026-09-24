@@ -43,6 +43,7 @@ background runs.
   - [A complete brand-monitoring workflow](#a-complete-brand-monitoring-workflow)
 - [Choosing resolvers](#choosing-resolvers)
 - [Performance notes](#performance-notes)
+- [Development and tests](#development-and-tests)
 - [Troubleshooting](#troubleshooting)
 - [Exit codes](#exit-codes)
 - [FAQ](#faq)
@@ -860,6 +861,55 @@ it at.
 That's the domain's real (punycode) form — what actually resolves and what you'd
 put in a blocklist. The `domain` column in `csv`/`json` shows the human-readable
 Unicode version too.
+
+---
+
+## Development and tests
+
+`test_twistr.py` is an offline test suite: it replaces DNS with a fake
+resolver, so it needs no network, finishes in about three seconds, and gives
+the same result every time.
+
+```bash
+pip install pytest
+pytest -q                 # from the directory holding twistr.py
+```
+
+```
+38 passed in 3.14s
+```
+
+Every test exists because the behaviour it checks broke at least once during
+development, and each one names that bug in its docstring. The suite covers:
+
+- **generation** — the original domain never appears in its own results,
+  candidates that encode to the same wire name are queried once, number-row
+  typos, whole-script IDN homographs, registry character rules, and
+  `--max-candidates` capping without starving the later fuzzers or cutting a
+  sorted dictionary to the front of the alphabet;
+- **DNS parsing** — answers filtered by record type and owner, so an alias
+  answer can't be mistaken for an address or a delegation;
+- **scanning** — apex-CNAME parked domains counted as registered, wildcard
+  zones *not* counted, persistent SERVFAIL classified as a lame delegation, MX
+  only queried with `-m`, a per-query deadline that stops one dead name
+  hanging the scan, and one pathological domain never aborting a run;
+- **output** — every format renders from unresolved defaults, `domains` output
+  ranked and deduplicated, `--live` streaming actually reaching disk, atomic
+  writes leaving no temp files, and timestamped filenames;
+- **resolvers** — filtering resolvers refused with the unfiltered alternative
+  named, the `unfiltered` preset, and `host:port` / IPv6 parsing;
+- **CLI and UI** — `--concurrency auto` and its validation, the plain
+  (redirected) progress renderer staying free of colour and carriage returns,
+  the fallback when `rich` is missing, and a static check that **every**
+  `ui.*` call site passes the arguments those helpers require.
+
+That last one is worth keeping: a single `ui.item()` call with a missing
+argument once crashed a real scan, and no unit test of the `UI` class can
+catch a bad call site. The check parses `twistr.py` and inspects every call.
+
+If you change twistr, run `pytest -q` before a long scan. The suite catches
+regressions in seconds that a 12-hour run would otherwise surface the hard
+way.
 
 ---
 
