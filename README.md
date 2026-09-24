@@ -237,8 +237,8 @@ python twistr.py [domains...] [options]
 
 | Option | Default | Description |
 |---|---|---|
-| `--concurrency N` | `64` | Max in-flight lookups per process. I/O-bound, so this can be high (200–1000 with good resolvers). |
-| `-P, --processes N` | `1` | Split the scan across N worker processes to use multiple cores. Helps most with `--web`/`ppdeep` or very high concurrency. |
+| `--concurrency N\|auto` | `auto` | Lookups in flight per process. `auto` starts at 64 and adapts while scanning: it raises the limit while throughput keeps improving, steps back when it stops, and backs off when resolvers start failing. The learned value carries over between targets. A number fixes it. |
+| `-P, --processes N` | `1` | Split each scan across N worker processes to use multiple CPU cores. Works in every mode, including multi-target lists. Only helps once one core is maxed out (see [Performance notes](#performance-notes)). |
 | `--timeout SECS` | `5.0` | Per-query DNS timeout. |
 | `--nameservers LIST` | *(system)* | Comma-separated resolvers, e.g. `1.1.1.1,8.8.4.4` or `127.0.0.1:5335` (needs `aiodns`). The word `unfiltered` expands to a vetted set of 12 unfiltered public resolvers. Multiple resolvers are load-balanced and health-checked at start. Known *filtering* resolvers are refused. See [Choosing resolvers](#choosing-resolvers). |
 | `--allow-filtering-resolvers` | | Allow resolvers that block domains (not recommended: blocked lookalikes look unregistered). |
@@ -574,14 +574,14 @@ python twistr.py example.com -r --fuzzers tld-swap --tld-file tlds.txt
 ### Performance tuning
 
 ```bash
-# Raise concurrency (biggest single speed lever; needs good resolvers)
-python twistr.py example.com -r --concurrency 400 --nameservers 1.1.1.1,8.8.4.4
+# Default: adaptive concurrency finds the right level for your resolvers
+python twistr.py -i brands.txt -r --nameservers unfiltered
 
-# Use multiple CPU cores (helps most with --web/--all-checks, e.g. 6 cores)
-python twistr.py -i brands.txt --all-checks -r -P 6 --concurrency 150
+# Use several CPU cores once one is maxed out (e.g. a fast local resolver)
+python twistr.py -i brands.txt -r --nameservers 127.0.0.1:5335 -P 4
 
-# Shorter timeout for a fast resolver on a big list
-python twistr.py -i brands.txt -r --timeout 3 --concurrency 300
+# Fix the concurrency yourself instead of adapting
+python twistr.py -i brands.txt -r --nameservers unfiltered --concurrency 200
 ```
 
 ### Piping and automation
@@ -740,13 +740,25 @@ validates DNSSEC; a domain with broken DNSSEC then shows up as a lame delegation
 
 ## Performance notes
 
-- twistr is **I/O-bound** — nearly all its time is spent waiting on DNS. The
-  single most effective speed lever is `--concurrency`, not CPU cores.
+- twistr is usually **waiting on DNS**, not using CPU. Speed is roughly
+  *lookups in flight ÷ resolver latency*: 64 in flight at ~27 ms is ~2,400/s.
+  The default `--concurrency auto` raises the number in flight until
+  throughput stops improving or the resolvers start dropping queries, then
+  holds there. In a test with 25 ms latency and a 6,000 queries/s limit it
+  scanned 2.3× faster than a fixed 64 (5,500/s vs 2,400/s), within a few
+  percent of the best hand-picked value, without overshooting into the limit.
+- Pushing concurrency *past* what your resolvers accept makes things
+  **slower**: dropped queries hold a slot for a full timeout and then need a
+  retry round. That is why `auto` backs off; if you fix `--concurrency` by
+  hand and the summary reports unresolved domains, lower it.
+- One process tops out around 15,000–17,000 lookups/s of CPU. Beyond that
+  (fast local resolver, big lists), `-P N` spreads the work over N cores.
+  It gives identical results and works in multi-target mode.
 - Install **`aiodns`** and **`uvloop`** for the fast path. Without `aiodns`,
   twistr falls back to a slower socket resolver (A/AAAA only, no `--nameservers`).
-- `-P/--processes` mainly helps when there's real per-domain CPU work
-  (`--web`/`ppdeep` content hashing) or at very high concurrency; for pure DNS,
-  a single process with high `--concurrency` is usually just as fast.
+- Memory: about 450 bytes per candidate while a target is being scanned, so
+  an uncapped 3.6M-candidate target needs ~1.6 GB. Use `--max-candidates` to
+  bound it.
 - Point it at **fast, reliable resolvers**: `--nameservers 1.1.1.1,8.8.4.4`.
   Multiple resolvers are load-balanced. A weak resolver under high concurrency
   will drop queries (twistr retries, but the summary will warn you if some
