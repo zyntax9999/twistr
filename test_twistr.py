@@ -1,0 +1,520 @@
+"""
+Offline test suite for twistr.
+
+Runs entirely without network: DNS is replaced by a fake resolver, so the
+whole suite finishes in seconds and gives the same result every time.
+
+    pip install pytest
+    pytest -q                # from the directory holding twistr.py
+
+Every test here exists because the behaviour it checks broke at least once
+during development. The bug each one guards against is named in its docstring.
+"""
+
+import asyncio
+import json
+import os
+import sys
+import types
+
+import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import twistr  # noqa: E402
+
+
+# --------------------------------------------------------------------------- #
+# helpers
+# --------------------------------------------------------------------------- #
+
+def perm(fuzzer="omission", domain="eample.com", ascii_=None, target="example.com",
+         **kw):
+    p = twistr.Permutation(fuzzer, domain, ascii_ or domain, target=target)
+    for k, v in kw.items():
+        setattr(p, k, v)
+    return p
+
+
+class FakeRecord:
+    def __init__(self, name, rtype, **data):
+        self.name = name
+        self.type = rtype
+        self.data = types.SimpleNamespace(**data)
+
+
+class FakeResult:
+    def __init__(self, answer=None):
+        self.answer = answer or []
+
+
+class FakeResolver:
+    """Stands in for aiodns. `zone` maps name -> dict(rtype -> values), and a
+    name that is absent raises NXDOMAIN. Special values: 'servfail', 'timeout'."""
+
+    def __init__(self, zone, wildcard_parents=()):
+        self.zone = zone
+        self.wildcard_parents = set(wildcard_parents)
+        self.calls = []
+
+    def cancel(self):
+        pass
+
+    def query_dns(self, name, rtype):
+        # aiodns returns a Future, not a coroutine - mirror that so the
+        # per-query deadline can cancel it exactly as it does in production
+        return asyncio.ensure_future(self._query(name, rtype))
+
+    async def _query(self, name, rtype):
+        self.calls.append((name, rtype))
+        entry = self.zone.get(name)
+        if entry is None and "." in name:
+            parent = name.split(".", 1)[1]
+            if parent in self.wildcard_parents:
+                entry = {"A": ["10.0.0.1"]}
+        if entry is None:
+            raise _ares_error(4, "Domain name not found")
+        if entry == "servfail":
+            raise _ares_error(3, "DNS server returned general failure")
+        if entry == "timeout":
+            await asyncio.sleep(10)          # caller's deadline cancels this
+            raise _ares_error(12, "Timeout")
+        vals = entry.get(rtype)
+        if not vals:
+            # a real resolver answers any query on an aliased name with the
+            # CNAME record itself, not NODATA
+            if rtype != "CNAME" and entry.get("CNAME"):
+                return FakeResult([FakeRecord(name, 5, cname=entry["CNAME"][0])])
+            raise _ares_error(1, "no data")
+        recs = []
+        for v in vals:
+            if rtype in ("A", "AAAA"):
+                recs.append(FakeRecord(name, twistr.Scanner._RTYPE[rtype], addr=v))
+            elif rtype == "NS":
+                recs.append(FakeRecord(name, 2, nsdname=v))
+            elif rtype == "MX":
+                recs.append(FakeRecord(name, 15, exchange=v))
+            elif rtype == "CNAME":
+                recs.append(FakeRecord(name, 5, cname=v))
+        return FakeResult(recs)
+
+
+def _ares_error(code, msg):
+    err = Exception(code, msg)
+    return err
+
+
+def scan_with(zone, perms, wildcard_parents=(), **kw):
+    """Run a real Scanner against the fake resolver."""
+    sc = twistr.Scanner(concurrency=kw.pop("concurrency", 8), timeout=0.2, **kw)
+
+    def use(timeout):
+        sc._resolver = FakeResolver(zone, wildcard_parents)
+        sc._qfn = sc._resolver.query_dns
+
+    sc._use_resolver = use
+    asyncio.run(sc.scan(perms, progress=None, prime=False))
+    return perms
+
+
+# --------------------------------------------------------------------------- #
+# domain parsing / generation
+# --------------------------------------------------------------------------- #
+
+def test_split_domain_handles_multi_label_suffixes():
+    assert twistr.split_domain("example.com")[1:] == ("example", "com")
+    sub, name, tld = twistr.split_domain("shop.example.co.uk")
+    assert (name, tld) == ("example", "co.uk")
+
+
+def test_split_domain_rejects_nonsense():
+    with pytest.raises(ValueError):
+        twistr.split_domain("notadomain")
+
+
+def test_generation_excludes_the_original_and_dedupes():
+    """Bug: confusables that IDNA-fold back to the real domain were emitted,
+    and two spellings encoding to one wire name were queried twice."""
+    perms = twistr.DomainFuzzer("paypal.com").generate()
+    cands = [p for p in perms if p.fuzzer != "original"]
+    assert "paypal.com" not in {p.ascii for p in cands}
+    assert len({p.ascii for p in cands}) == len(cands)
+
+
+def test_number_row_typos_are_generated():
+    """Bug: keyboard maps omitted the digit row, missing pa7pal/payp0al."""
+    out = {p.ascii for p in twistr.DomainFuzzer("paypal.com").generate()}
+    assert {"pa7pal.com", "payp0al.com"} <= out
+
+
+def test_whole_script_idn_homograph():
+    out = {p.fuzzer for p in twistr.DomainFuzzer("apple.com").generate(["homoglyph"])}
+    assert "homoglyph-script" in out
+
+
+def test_registry_idn_policy_filters_and_all_idn_restores():
+    """Characters a registry refuses are skipped unless --all-idn."""
+    strict = len(twistr.DomainFuzzer("dnb.no").generate())
+    loose = len(twistr.DomainFuzzer("dnb.no", idn_policy=False).generate())
+    assert strict < loose
+    assert twistr._idn_allowed("xn--dnb-qla.no", "no") in (True, False)   # no crash
+    assert twistr._idn_allowed("plain.no", "no") is True
+
+
+def test_max_candidates_is_exact_and_spares_other_fuzzers():
+    """Bug: the cap stopped generation inside the dictionary, so tld-swap,
+    tld-typo and various never ran at all."""
+    words = [f"w{i}" for i in range(50000)]
+    fz = twistr.DomainFuzzer("northface.com", dictionary=words,
+                             tlds=["net", "shop"])
+    out = fz.generate(max_candidates=5000)
+    assert 4900 <= len(out) - 1 <= 5000        # a cap, never exceeded
+    kinds = {p.fuzzer for p in out}
+    assert {"tld-swap", "tld-typo", "various", "omission"} <= kinds
+
+
+def test_dictionary_trim_samples_across_the_whole_list():
+    """Bug: a sorted dictionary was cut to its first N words, so only the
+    start of the alphabet was ever tried."""
+    words = sorted(f"{c}{i:04d}" for c in "abcdefghijklmnopqrstuvwxyz"
+                   for i in range(400))
+    fz = twistr.DomainFuzzer("brand.com", dictionary=words)
+    out = fz.generate(max_candidates=4000)
+    used = {p.domain[0] for p in out if p.fuzzer == "dictionary"}
+    assert len(used & set("abcdefghijklmnopqrstuvwxyz")) > 10
+    assert fz.trim_note
+
+
+def test_generation_is_deterministic():
+    a = [p.ascii for p in twistr.DomainFuzzer("paypal.com").generate()]
+    b = [p.ascii for p in twistr.DomainFuzzer("paypal.com").generate()]
+    assert a == b
+
+
+# --------------------------------------------------------------------------- #
+# DNS answer parsing
+# --------------------------------------------------------------------------- #
+
+def test_dns_values_filters_by_record_type():
+    """Bug: an alias answer also carries CNAME records, so an A query could
+    pick up the CNAME value."""
+    res = FakeResult([FakeRecord("x.com", 5, cname="target.example"),
+                      FakeRecord("x.com", 1, addr="1.2.3.4")])
+    assert twistr.Scanner._dns_values(res, "A", "x.com") == ["1.2.3.4"]
+    assert twistr.Scanner._dns_values(res, "CNAME", "x.com", own=True) == \
+        ["target.example"]
+
+
+def test_dns_values_ignores_ns_of_an_alias_target():
+    """Bug: NS on an aliased name returns the *target's* nameservers, which is
+    not a delegation of the queried name."""
+    res = FakeResult([FakeRecord("other.example", 2, nsdname="ns1.other")])
+    assert twistr.Scanner._dns_values(res, "NS", "x.com") == []
+
+
+def test_dns_values_reads_mx_exchange():
+    res = FakeResult([FakeRecord("x.com", 15, exchange="mx1.x")])
+    assert twistr.Scanner._dns_values(res, "MX", "x.com") == ["mx1.x"]
+
+
+# --------------------------------------------------------------------------- #
+# scanning behaviour
+# --------------------------------------------------------------------------- #
+
+def test_scan_marks_registered_and_unregistered():
+    zone = {"live.com": {"NS": ["ns1.x"], "A": ["1.2.3.4"]}}
+    a, b = perm(ascii_="live.com", domain="live.com"), perm(ascii_="dead.com",
+                                                            domain="dead.com")
+    scan_with(zone, [a, b])
+    assert a.registered and a.dns_a == ["1.2.3.4"]
+    assert not b.registered
+
+
+def test_apex_cname_counts_as_registered():
+    """Bug: parked domains with only a CNAME at the apex were reported dead."""
+    zone = {"parked.com": {"CNAME": ["x.bodis.com"]}}
+    p = perm(ascii_="parked.com", domain="parked.com")
+    scan_with(zone, [p])
+    assert p.registered and p.dns_cname == ["x.bodis.com"]
+
+
+def test_wildcard_zone_is_not_a_registration():
+    """Bug: TLDs answering for every name (e.g. co.com) made every candidate
+    look registered."""
+    zone = {}
+    p = perm(ascii_="anything.co.com", domain="anything.co.com")
+    scan_with(zone, [p], wildcard_parents={"co.com"})
+    assert p.wildcard and not p.registered
+
+
+def test_persistent_servfail_is_a_lame_delegation():
+    zone = {"broken.com": "servfail"}
+    p = perm(ascii_="broken.com", domain="broken.com")
+    scan_with(zone, [p])
+    assert p.dns_ns == ["!servfail"] and p.registered
+
+
+def test_mx_is_only_queried_when_asked():
+    zone = {"m.com": {"NS": ["ns"], "A": ["1.1.1.1"], "MX": ["mx.m"]}}
+    p = perm(ascii_="m.com", domain="m.com")
+    scan_with(zone, [p])
+    assert not p.dns_mx
+    q = perm(ascii_="m.com", domain="m.com")
+    scan_with(zone, [q], do_mx=True)
+    assert q.dns_mx == ["mx.m"]
+
+
+def test_timeouts_do_not_hang_the_scan():
+    """Bug: without a per-query deadline, c-ares walked every resolver in turn
+    and a dead name could take minutes."""
+    zone = {"slow.com": "timeout"}
+    p = perm(ascii_="slow.com", domain="slow.com")
+    scan_with(zone, [p])
+    assert not p.registered      # settled, not hung
+
+
+def test_one_bad_domain_does_not_abort_the_scan():
+    """Bug: a single unhandled exception ended the whole run."""
+    zone = {"ok.com": {"NS": ["ns"], "A": ["1.1.1.1"]}}
+    good, bad = perm(ascii_="ok.com", domain="ok.com"), perm(ascii_="boom.com",
+                                                             domain="boom.com")
+    sc = twistr.Scanner(concurrency=4, timeout=0.2)
+
+    def use(timeout):
+        sc._resolver = FakeResolver(zone)
+        orig = sc._resolver.query_dns
+
+        def q(name, rtype):
+            if name == "boom.com":
+                async def boom():
+                    raise RuntimeError("pathological domain")
+                return asyncio.ensure_future(boom())
+            return orig(name, rtype)
+        sc._qfn = q
+    sc._use_resolver = use
+    asyncio.run(sc.scan([good, bad], progress=None, prime=False))
+    assert good.registered and not bad.registered
+
+
+# --------------------------------------------------------------------------- #
+# scoring
+# --------------------------------------------------------------------------- #
+
+def test_score_rises_with_danger_signals():
+    base = twistr.score(perm(fuzzer="homoglyph"))
+    live = twistr.score(perm(fuzzer="homoglyph", dns_a=["1.2.3.4"]))
+    mail = twistr.score(perm(fuzzer="homoglyph", dns_a=["1.2.3.4"],
+                             dns_mx=["mx"]))
+    fresh = twistr.score(perm(fuzzer="homoglyph", dns_a=["1.2.3.4"],
+                              dns_mx=["mx"], age_days=5))
+    clone = twistr.score(perm(fuzzer="homoglyph", dns_a=["1.2.3.4"],
+                              dns_mx=["mx"], age_days=5, favicon_match=True))
+    assert base < live < mail < fresh < clone <= 100
+
+
+def test_score_is_capped():
+    p = perm(fuzzer="homoglyph", dns_a=["1"], dns_mx=["m"], age_days=1,
+             favicon_match=True, fuzzy=100, http_status=200, ct=True,
+             title="paypal login")
+    assert twistr.score(p) == 100
+
+
+# --------------------------------------------------------------------------- #
+# output
+# --------------------------------------------------------------------------- #
+
+@pytest.fixture
+def rows():
+    return [perm(ascii_="a.com", domain="a.com", risk=80, dns_a=["1.1.1.1"]),
+            perm(ascii_="b.com", domain="b.com", risk=20),
+            perm("original", "example.com", "example.com")]
+
+
+def test_rows_filters_original_registered_and_length(rows):
+    assert {p.ascii for p in twistr._rows(rows, False)} == {"a.com", "b.com"}
+    assert {p.ascii for p in twistr._rows(rows, True)} == {"a.com"}
+    assert twistr._rows(rows, False, min_length=99) == []
+
+
+def test_renderers_handle_unresolved_defaults(rows):
+    """Bug: switching the DNS fields to a shared empty tuple broke the table
+    renderer with 'can only concatenate list (not tuple) to list'."""
+    assert "a.com" in twistr.render_domains(rows, False)
+    assert "risk,target,fuzzer" in twistr.render_csv(rows, False)
+    json.loads(twistr.render_json(rows, False))
+    twistr.render_table(rows, False)          # must not raise
+
+
+def test_domains_output_is_ranked_and_unique(rows):
+    out = twistr.render_domains(rows + [rows[0]], False).split()
+    assert out == ["a.com", "b.com"]          # risk 80 first, deduped
+
+
+def test_live_writer_streams_and_filters(tmp_path):
+    """Bug: --live reported success without writing anything."""
+    path = tmp_path / "out.txt"
+    w = twistr.LiveWriter(str(path), "domains", True, 0)
+    w.feed(perm(ascii_="live.com", domain="live.com", dns_a=["1.1.1.1"]))
+    w.feed(perm(ascii_="dead.com", domain="dead.com"))       # filtered out
+    assert path.read_text().split() == ["live.com"]          # flushed already
+    w.close()
+
+
+def test_atomic_write_replaces_whole_file(tmp_path):
+    path = tmp_path / "x.txt"
+    twistr._atomic_write(str(path), "one\n")
+    twistr._atomic_write(str(path), "two\n")
+    assert path.read_text() == "two\n"
+    assert not list(tmp_path.glob(".twistr-*"))              # no temp left over
+
+
+def test_output_path_timestamping(tmp_path):
+    args = types.SimpleNamespace(format="domains", output=None,
+                                 outdir=str(tmp_path), timestamp=True)
+    p1 = twistr._resolve_output_path(args, ["example.com"])
+    assert p1.startswith(str(tmp_path)) and p1.endswith(".txt")
+    args2 = types.SimpleNamespace(format="csv", output=None, outdir=None,
+                                  timestamp=False)
+    assert twistr._resolve_output_path(args2, ["example.com"]) is None
+
+
+# --------------------------------------------------------------------------- #
+# resolvers
+# --------------------------------------------------------------------------- #
+
+def test_filtering_resolvers_are_refused_with_an_alternative():
+    """A filtering resolver hides exactly what twistr hunts for."""
+    ns, err = twistr.parse_nameservers("9.9.9.9,8.8.8.8")
+    assert ns is None and "9.9.9.10" in err
+    ns, err = twistr.parse_nameservers("9.9.9.9", allow_filtering=True)
+    assert ns == ["9.9.9.9"] and err is None
+
+
+def test_unfiltered_preset_expands_and_dedupes():
+    ns, err = twistr.parse_nameservers("unfiltered,1.1.1.1")
+    assert err is None and len(ns) == len(set(ns)) and "1.1.1.1" in ns
+    assert len(ns) >= 10
+
+
+def test_nameserver_host_parsing():
+    assert twistr._ns_host("127.0.0.1:5335") == "127.0.0.1"
+    assert twistr._ns_host("[2606:4700:4700::1111]:53") == "2606:4700:4700::1111"
+    assert twistr._ns_host("2620:fe::10") == "2620:fe::10"
+
+
+def test_control_d_filtering_variants_are_caught():
+    """One digit apart from the unfiltered pair."""
+    ns, err = twistr.parse_nameservers("76.76.2.2")
+    assert ns is None and "76.76.2.0" in err
+
+
+# --------------------------------------------------------------------------- #
+# CLI / UI plumbing
+# --------------------------------------------------------------------------- #
+
+def test_concurrency_argument_accepts_auto_and_numbers():
+    assert twistr._concurrency_arg("auto") == "auto"
+    assert twistr._concurrency_arg("200") == 200
+    for bad in ("abc", "0", "-5"):
+        with pytest.raises(Exception):
+            twistr._concurrency_arg(bad)
+
+
+def test_ui_helpers_have_the_arity_callers_use(capsys):
+    """Bug: a call site used ui.item() with one argument and crashed the run
+    the first time a resolver was unhealthy."""
+    ui = twistr.UI(sys.stderr)
+    ui.item("label", "value")
+    ui.item("label", "value", "green")
+    for fn in (ui.note, ui.warn, ui.error, ui.ok, ui.line):
+        fn("text")
+    ui.header("t", [("a", "b", None)])
+    ui.rule("x")
+
+
+def test_every_ui_call_site_has_the_right_arity():
+    """Bug: one call site used ui.item() with a single argument and crashed
+    the scan the first time a resolver turned out to be unhealthy. A unit test
+    on UI cannot catch that, so check every call site in the source."""
+    import ast
+    tree = ast.parse(open(os.path.join(os.path.dirname(
+        os.path.abspath(__file__)), "twistr.py")).read())
+    expected = {"item": 2, "header": 2, "note": 1, "warn": 1, "error": 1,
+                "ok": 1, "rule": None, "line": None}
+    problems = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)):
+            continue
+        recv = node.func.value
+        if not (isinstance(recv, ast.Name) and recv.id == "ui"):
+            continue
+        want = expected.get(node.func.attr, "skip")
+        if want in ("skip", None):
+            continue
+        pos = [a for a in node.args if not isinstance(a, ast.Starred)]
+        starred = any(isinstance(a, ast.Starred) for a in node.args)
+        if starred or len(pos) < want:
+            problems.append(f"line {node.lineno}: ui.{node.func.attr} "
+                            f"got {len(pos)} positional args, needs {want}"
+                            + (" (*args splat)" if starred else ""))
+    assert not problems, "\n".join(problems)
+
+
+def test_plain_progress_emits_status_and_never_uses_escape_codes(capsys):
+    """Redirected output (nohup) must stay free of colour and \\r."""
+    class Sink:
+        def __init__(self):
+            self.text = ""
+
+        def isatty(self):
+            return False
+
+        def write(self, s):
+            self.text += s
+
+        def flush(self):
+            pass
+    sink = Sink()
+    ui = twistr.UI(sink)
+    pr = twistr.Progress(mode="plain", ui=ui)
+    pr.begin(1)
+    pr.start_target(1, 1, "example.com", 100)
+    for i in range(1, 101):
+        pr.update_target(i, i // 10)
+    pr.target_done({"idx": 1, "name": "example.com", "live": 10,
+                    "candidates": 100, "secs": 1.0, "top": None})
+    pr.close()
+    assert "example.com" in sink.text
+    assert "\x1b" not in sink.text and "\r" not in sink.text
+
+
+def test_make_progress_falls_back_without_rich(monkeypatch):
+    class Sink:
+        def isatty(self):
+            return True
+
+        def write(self, s):
+            pass
+
+        def flush(self):
+            pass
+    monkeypatch.setattr(twistr, "_HAVE_RICH", False)
+    ui = twistr.UI(Sink())
+    assert type(twistr.make_progress("auto", ui)) is twistr.Progress
+
+
+def test_target_stats_picks_the_highest_risk_find():
+    tp = [perm("original", "example.com", "example.com"),
+          perm(ascii_="a.com", domain="a.com", risk=30, dns_a=["1"]),
+          perm(ascii_="b.com", domain="b.com", risk=90, dns_a=["1"])]
+    st = twistr._target_stats(tp, idx=1, secs=2.0)
+    assert st["live"] == 2 and st["top"].ascii == "b.com" and st["high"] == 1
+
+
+def test_parser_accepts_a_realistic_command_line():
+    args = twistr.build_parser().parse_args(
+        ["-i", "brands.txt", "-r", "-m", "--nameservers", "unfiltered",
+         "--max-candidates", "300000", "--live", "--format", "domains",
+         "--outdir", "results/"])
+    assert args.registered and args.mx and args.live
+    assert args.concurrency == "auto" and args.max_candidates == 300000
