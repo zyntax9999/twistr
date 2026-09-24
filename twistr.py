@@ -1541,7 +1541,9 @@ class Scanner:
             # dead name could take 12 x timeout. A single timer that cancels
             # the future caps the total, and is far cheaper than
             # asyncio.wait_for (which cost ~13% CPU per query).
-            fut = self._qfn(name, rtype)
+            # aiodns returns a Future; ensure_future keeps the deadline
+            # working if that ever becomes a plain coroutine
+            fut = asyncio.ensure_future(self._qfn(name, rtype))
             expired = []
             timer = self._loop.call_later(
                 self.timeout, lambda f=fut, x=expired: (x.append(1), f.cancel()))
@@ -2248,6 +2250,9 @@ class LiveWriter:
 # CLI
 # --------------------------------------------------------------------------- #
 
+__version__ = "1.0.0"
+
+
 def _concurrency_arg(value):
     if str(value).lower() == "auto":
         return "auto"
@@ -2274,6 +2279,8 @@ def build_parser():
     p.add_argument("--all-idn", action="store_true",
                    help="generate IDN lookalikes even with characters the "
                         "TLD's registry does not accept (default: skip them)")
+    p.add_argument("-V", "--version", action="version",
+                   version=f"twistr {__version__}")
     p.add_argument("--list-fuzzers", action="store_true",
                    help="print available fuzzers and exit")
     p.add_argument("--dictionary", metavar="FILE",
@@ -3031,7 +3038,8 @@ def main(argv=None):
                          + ("  (live)" if writer else ""), "cyan"))
         else:
             rows.append(("output", f"{args.format} → stdout", None))
-        rows.append(("started", time.strftime("%Y-%m-%d %H:%M:%S"), None))
+        rows.append(("started", time.strftime("%Y-%m-%d %H:%M:%S")
+                     + f"  ·  twistr {__version__}", None))
         ui.header("twistr", rows)
 
     if res_results is not None:
