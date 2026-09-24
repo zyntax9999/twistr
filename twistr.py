@@ -398,11 +398,15 @@ class Permutation:
     ascii: str             # punycode form (what DNS resolves), may equal domain
     target: str = ""       # the input domain this permutation was derived from
     # Populated during scanning:
-    dns_a: list[str] = field(default_factory=list)
-    dns_aaaa: list[str] = field(default_factory=list)
-    dns_mx: list[str] = field(default_factory=list)
-    dns_cname: list[str] = field(default_factory=list)  # alias at the name
-    dns_ns: list[str] = field(default_factory=list)
+    # DNS answers. Default is one shared empty tuple: most candidates never
+    # get any, and five fresh lists per candidate cost ~40% of the memory on
+    # multi-million-candidate targets. Values are always replaced, never
+    # mutated in place.
+    dns_a: list[str] | tuple = ()
+    dns_aaaa: list[str] | tuple = ()
+    dns_mx: list[str] | tuple = ()
+    dns_cname: list[str] | tuple = ()  # alias at the name
+    dns_ns: list[str] | tuple = ()
     http_status: int | None = None
     http_server: str | None = None
     title: str | None = None       # HTML <title> of the candidate homepage
@@ -1428,13 +1432,58 @@ def ct_discover(original: str, name: str, seen: set, timeout=20.0):
 
 # --------------------------------------------------------------------------- #
 
+class _Gate:
+    """Semaphore whose capacity can change while tasks wait on it."""
+
+    def __init__(self, limit):
+        self.limit = max(1, int(limit))
+        self.active = 0
+        self._waiters = collections.deque()
+
+    async def acquire(self):
+        if self.active < self.limit and not self._waiters:
+            self.active += 1
+            return
+        fut = asyncio.get_running_loop().create_future()
+        self._waiters.append(fut)
+        await fut                       # the releaser counted us as active
+
+    def release(self):
+        self.active -= 1
+        self._wake()
+
+    def set_limit(self, limit):
+        self.limit = max(1, int(limit))
+        self._wake()
+
+    @property
+    def waiting(self):
+        return len(self._waiters)
+
+    def _wake(self):
+        while self._waiters and self.active < self.limit:
+            fut = self._waiters.popleft()
+            if not fut.done():
+                self.active += 1
+                fut.set_result(None)
+
+
+# the concurrency the adaptive controller settled on, carried from one target
+# (and one Scanner) to the next so each target does not start slow again
+_LEARNED = {"limit": None}
+_AUTO_MIN, _AUTO_START, _AUTO_MAX = 16, 64, 2048
+
+
 class Scanner:
     def __init__(self, concurrency=64, timeout=5.0, nameservers=None,
                  do_web=False, do_rdap=False, do_favicon=False, do_mx=False,
                  base_fuzzy=None, base_favicon=None):
-        self.concurrency = concurrency
+        self.adaptive = (concurrency == "auto")
+        self.concurrency = (_LEARNED["limit"] or _AUTO_START) if self.adaptive \
+            else int(concurrency)
         self.do_mx = do_mx
-        self.sem = asyncio.Semaphore(concurrency)
+        self._qn = 0            # query attempts finished (for the controller)
+        self._qf = 0            # of which transient failures (timeout/servfail)
         self.timeout = timeout
         self.do_web = do_web and _HAVE_AIOHTTP
         self.do_rdap = do_rdap and _HAVE_AIOHTTP
@@ -1487,21 +1536,43 @@ class Scanner:
         status is ok | nx (NXDOMAIN) | nodata | servfail | fail (timeout etc)."""
         status = "fail"
         for attempt in range(attempts):
+            # Hard per-query deadline. c-ares's own timeout is per *server*:
+            # after one times out it tries the next, so with 12 resolvers a
+            # dead name could take 12 x timeout. A single timer that cancels
+            # the future caps the total, and is far cheaper than
+            # asyncio.wait_for (which cost ~13% CPU per query).
+            fut = self._qfn(name, rtype)
+            expired = []
+            timer = self._loop.call_later(
+                self.timeout, lambda f=fut, x=expired: (x.append(1), f.cancel()))
             try:
-                res = await asyncio.wait_for(self._qfn(name, rtype),
-                                             self.timeout)
+                res = await fut
+                self._qn += 1
                 return ("ok", self._dns_values(res, rtype, name),
                         self._dns_values(res, "CNAME", name, own=True))
+            except asyncio.CancelledError:
+                if not expired:
+                    raise               # a real cancellation (Ctrl-C, shutdown)
+                self._qn += 1
+                self._qf += 1
+                status = "servfail" if status == "servfail" else "fail"
+                if attempt + 1 < attempts:
+                    await asyncio.sleep(0.2 * (attempt + 1))
+                continue
             except Exception as e:
+                self._qn += 1
                 code = e.args[0] if getattr(e, "args", None) else None
                 if code == 4:
                     return "nx", None, None     # definitive: does not exist
                 if code == 1:
                     return "nodata", None, None  # exists, no such record
+                self._qf += 1
                 status = ("servfail" if code == 3 or status == "servfail"
                           else "fail")
                 if attempt + 1 < attempts:
                     await asyncio.sleep(0.2 * (attempt + 1))
+            finally:
+                timer.cancel()
         return status, None, None
 
     async def _resolve_aiodns(self, perm: Permutation, attempts=2):
@@ -1705,45 +1776,115 @@ class Scanner:
     def _unsettled(perm):
         return getattr(perm, "_dns", "") in ("servfail", "fail")
 
-    async def _pool(self, items, session, width, attempts, on_done):
-        """Bounded worker pool: only `width` scans in flight at any moment, so
-        file descriptors / memory stay flat over long, large runs."""
-        queue = asyncio.Queue()
-        for p in items:
-            queue.put_nowait(p)
+    async def _pool(self, items, session, width, attempts, on_done,
+                    adaptive=False):
+        """Bounded worker pool: at most gate.limit scans in flight, so file
+        descriptors / memory stay flat. With adaptive=True the limit is tuned
+        while running (see _control)."""
+        queue = collections.deque(items)
+        gate = _Gate(width)
+        done = [0]
 
         async def worker():
             while True:
-                try:
-                    perm = queue.get_nowait()
-                except asyncio.QueueEmpty:
+                await gate.acquire()
+                if not queue:
+                    gate.release()
                     return
-                await self._scan_one(perm, session, attempts)
+                perm = queue.popleft()
+                try:
+                    await self._scan_one(perm, session, attempts)
+                finally:
+                    gate.release()
+                done[0] += 1
                 on_done(perm)
 
-        n = max(1, min(width, len(items)))
-        await asyncio.gather(*[worker() for _ in range(n)])
+        n_workers = _AUTO_MAX if adaptive else width
+        n_workers = max(1, min(n_workers, len(items)))
+        ctl = None
+        if adaptive and len(items) > 2000:
+            ctl = asyncio.ensure_future(self._control(gate, queue, done))
+        try:
+            await asyncio.gather(*[worker() for _ in range(n_workers)])
+        finally:
+            if ctl is not None:
+                ctl.cancel()
+                try:
+                    await ctl
+                except BaseException:
+                    pass
+
+    async def _control(self, gate, queue, done):
+        """Adaptive concurrency: raise queries-in-flight while throughput keeps
+        rising, step back when it stops (CPU- or resolver-bound), and back off
+        hard when transient failures appear (rate limiting / overload)."""
+        window = 1.0
+        hold = 0
+        prev_rate = None
+        prev_limit = gate.limit
+        last_done, last_qn, last_qf = done[0], self._qn, self._qf
+        while True:
+            await asyncio.sleep(window)
+            n, qn, qf = done[0], self._qn, self._qf
+            rate = (n - last_done) / window
+            q, f = qn - last_qn, qf - last_qf
+            last_done, last_qn, last_qf = n, qn, qf
+            if len(queue) < gate.limit * 2:
+                continue                # draining: no signal left
+            fail = f / q if q else 0.0
+            if q >= 50 and fail > 0.02:
+                gate.set_limit(max(_AUTO_MIN, int(gate.limit * 0.7)))
+                hold, prev_rate = 5, None
+            elif hold > 0:
+                hold -= 1
+                prev_rate = None
+            elif prev_rate is not None and gate.limit > prev_limit \
+                    and rate < prev_rate * 1.05:
+                # the last increase bought nothing: go back, rest, then probe
+                gate.set_limit(prev_limit)
+                hold, prev_rate = 8, None
+            elif gate.active >= gate.limit * 0.9 and gate.limit < _AUTO_MAX:
+                prev_limit, prev_rate = gate.limit, rate
+                gate.set_limit(min(_AUTO_MAX, int(gate.limit * 1.3) + 4))
+            else:
+                prev_rate = rate
+            _LEARNED["limit"] = gate.limit
+            self.concurrency = gate.limit
+
+    def _use_resolver(self, timeout):
+        """(Re)create the c-ares resolver with the given per-query timeout.
+        The timeout lives in c-ares itself, so a longer one (calm retry
+        rounds) needs a fresh resolver."""
+        old = self._resolver
+        kw = dict(timeout=timeout, tries=1)
+        if self.nameservers and len(self.nameservers) > 1:
+            kw["rotate"] = True         # spread load across all resolvers
+        try:
+            self._resolver = aiodns.DNSResolver(
+                nameservers=self.nameservers or None, **kw)
+        except TypeError:                # older aiodns without these options
+            self._resolver = aiodns.DNSResolver(
+                nameservers=self.nameservers or None, timeout=timeout)
+        # prefer the non-deprecated query_dns() (aiodns >= 4.0)
+        self._qfn = getattr(self._resolver, "query_dns", None) \
+            or self._resolver.query
+        if old is not None:
+            try:
+                old.cancel()
+            except Exception:
+                pass
 
     async def scan(self, perms, progress=None, prime=True, on_result=None):
+        self._loop = asyncio.get_running_loop()
         if _HAVE_AIODNS:
-            kw = dict(timeout=self.timeout, tries=1)
-            if self.nameservers and len(self.nameservers) > 1:
-                kw["rotate"] = True     # spread load across all resolvers
-            try:
-                self._resolver = aiodns.DNSResolver(
-                    nameservers=self.nameservers or None, **kw)
-            except TypeError:            # older aiodns without these options
-                self._resolver = aiodns.DNSResolver(
-                    nameservers=self.nameservers or None, timeout=self.timeout)
-            # prefer the non-deprecated query_dns() (aiodns >= 4.0)
-            self._qfn = getattr(self._resolver, "query_dns", None) \
-                or self._resolver.query
+            self._use_resolver(self.timeout)
         else:
             # the socket resolver runs in the loop's thread pool, whose default
             # size (~min(32, cpus+4)) would otherwise cap --concurrency
             loop = asyncio.get_running_loop()
             loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(
-                max_workers=min(self.concurrency, 256)))
+                max_workers=min(_AUTO_MAX if self.adaptive
+                                else self.concurrency, 256)))
         session = None
         if self.do_web or self.do_rdap or self.do_favicon:
             session = self._make_session()
@@ -1778,7 +1919,7 @@ class Scanner:
             if progress:
                 progress.start(len(perms))
             await self._pool(perms, session, self.concurrency, 2,
-                             first_pass_done)
+                             first_pass_done, adaptive=self.adaptive)
             if progress:
                 progress.finish(done, live)
             finished = True
@@ -1789,14 +1930,25 @@ class Scanner:
             # the TLD delegated the name, so it is registered (dnstwist agrees).
             if unsettled:
                 self._calm = True
-                width = max(4, min(16, self.concurrency // 8))
                 for rnd in range(3):
                     if not unsettled:
                         break
                     self.timeout *= 1.5
-                    await self._pool(unsettled, session, width, 3,
+                    if _HAVE_AIODNS:
+                        self._use_resolver(self.timeout)
+                    # sized by the work left, NOT by the learned concurrency:
+                    # a slow resolver can teach 'auto' a small limit, and the
+                    # retry rounds must not inherit that
+                    width = max(8, min(32, len(unsettled)))
+                    await self._pool(unsettled, session, width, 2,
                                      lambda p: None)
-                    last = rnd == 2
+                    still = [p for p in unsettled
+                             if getattr(p, "_dns", "") in ("servfail", "fail")]
+                    # a round that recovered nothing will not be helped by
+                    # another, longer one: classify what is left now instead
+                    # of spending up to ~a minute more on names that never
+                    # answer
+                    last = rnd == 2 or len(still) == len(unsettled)
                     remaining = []
                     for p in unsettled:
                         st = getattr(p, "_dns", "")
@@ -1811,7 +1963,6 @@ class Scanner:
                             p.risk = score(p)
                         emit(p)
                     unsettled = remaining
-                    width = max(2, width // 2)
         finally:
             if progress and not finished:
                 progress.finish(done, live)
@@ -1888,7 +2039,8 @@ def run_scan(perms, *, processes, concurrency, timeout, nameservers,
                 nameservers=nameservers, do_web=do_web, do_rdap=do_rdap,
                 do_favicon=do_favicon, do_mx=do_mx)
 
-    batch_size = max(25, math.ceil(len(perms) / (max(processes, 1) * 10)))
+    shards = max(processes, 1) * (4 if concurrency == "auto" else 10)
+    batch_size = max(25, math.ceil(len(perms) / shards))
     batches = [perms[i:i + batch_size]
                for i in range(0, len(perms), batch_size)]
 
@@ -1913,7 +2065,8 @@ def run_scan(perms, *, processes, concurrency, timeout, nameservers,
     payloads = [(b, opts, base_fuzzy, base_favicon, _HAVE_UVLOOP)
                 for b in batches]
     results, done, live = [], 0, 0
-    progress.start(len(perms))
+    if progress:
+        progress.start(len(perms))
     ctx = mp.get_context("fork" if sys.platform != "win32" else "spawn")
     with ctx.Pool(processes) as pool:
         for scanned in pool.imap_unordered(_scan_chunk, payloads):
@@ -1923,8 +2076,10 @@ def run_scan(perms, *, processes, concurrency, timeout, nameservers,
             if on_result:
                 for p in scanned:
                     on_result(p)
-            progress.update(done, live)
-    progress.finish(done, live)
+            if progress:
+                progress.update(done, live)
+    if progress:
+        progress.finish(done, live)
     return results
 
 
@@ -1973,7 +2128,7 @@ def render_table(perms, only_registered, min_length=0):
         for col in cols:
             t.add_column(col)
         for p in rows:
-            addrs = ", ".join(p.dns_a + p.dns_aaaa) or "-"
+            addrs = ", ".join([*p.dns_a, *p.dns_aaaa]) or "-"
             mx = ", ".join(p.dns_mx) or "-"
             http = str(p.http_status) if p.http_status else "-"
             style = "red" if p.risk >= 70 else "yellow" if p.risk >= 45 else None
@@ -1993,7 +2148,7 @@ def render_table(perms, only_registered, min_length=0):
     print(f"{'risk':>4}  {hdr_tgt}{'fuzzer':<13} {'domain':<34} addresses")
     print("-" * (78 + (21 if multi else 0)))
     for p in rows:
-        addrs = ", ".join(p.dns_a + p.dns_aaaa) or "-"
+        addrs = ", ".join([*p.dns_a, *p.dns_aaaa]) or "-"
         age = f" [{p.age_days}d]" if p.age_days is not None else ""
         tcol = f"{p.target:<20} " if multi else ""
         print(f"{p.risk:>4}  {tcol}{p.fuzzer:<13} {p.domain:<34} {addrs}{age}")
@@ -2093,6 +2248,18 @@ class LiveWriter:
 # CLI
 # --------------------------------------------------------------------------- #
 
+def _concurrency_arg(value):
+    if str(value).lower() == "auto":
+        return "auto"
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("expected a number or 'auto'")
+    if n < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return n
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         description="Generate and scan lookalike domains (dnstwist-style).")
@@ -2145,9 +2312,12 @@ def build_parser():
                         "exhaustion.")
     p.add_argument("--no-scan", action="store_true",
                    help="only generate permutations, do not query DNS")
-    p.add_argument("--concurrency", type=int, default=64,
-                   help="max in-flight lookups per process (I/O-bound, so this "
-                        "can be high: 200-1000 with fast resolvers)")
+    p.add_argument("--concurrency", type=_concurrency_arg, default="auto",
+                   metavar="N|auto",
+                   help="lookups in flight per process. 'auto' (default) "
+                        "starts at 64 and adapts: it raises the limit while "
+                        "throughput keeps improving and backs off when the "
+                        "resolvers start failing. A number fixes it.")
     p.add_argument("-P", "--processes", type=int, default=1,
                    help="split the scan across N worker processes to use "
                         "multiple cores (helps most with --web/ppdeep or very "
@@ -2538,7 +2708,9 @@ def _summarize(ui, perms, only_registered, ml, elapsed, total_generated,
         grid.add_row("checked", f"{total_generated:,} candidates across "
                      f"{len(target_stats)} target"
                      f"{'s' if len(target_stats) != 1 else ''}")
-        grid.add_row("time", f"{_fmt_dur(elapsed)} · avg {rate:,.0f}/s")
+        grid.add_row("time", f"{_fmt_dur(elapsed)} · avg {rate:,.0f}/s"
+                     + (f" · concurrency settled at {_LEARNED['limit']}"
+                        if _LEARNED["limit"] else ""))
         if filt:
             grid.add_row("dns", Text(filt, style="yellow" if unresolved
                                      else "dim"))
@@ -2619,7 +2791,9 @@ def _summarize(ui, perms, only_registered, ml, elapsed, total_generated,
             f"{low} low)", "green" if live else "grey")
     ui.item("checked", f"{total_generated:,} candidates across "
             f"{len(target_stats)} target{'s' if len(target_stats) != 1 else ''}")
-    ui.item("time", f"{_fmt_dur(elapsed)} (avg {rate:,.0f}/s)")
+    ui.item("time", f"{_fmt_dur(elapsed)} (avg {rate:,.0f}/s"
+            + (f", concurrency settled at {_LEARNED['limit']}"
+               if _LEARNED["limit"] else "") + ")")
     if filt:
         ui.item("dns", filt, "yellow" if unresolved else "grey")
     if by_fuzzer:
@@ -2847,7 +3021,9 @@ def main(argv=None):
             rows.append(("resolvers", "system resolver (aiodns not installed)",
                          "yellow"))
         if not args.no_scan:
-            rows.append(("concurrency", f"{args.concurrency}" +
+            conc = ("auto (adaptive, starts at 64)"
+                    if args.concurrency == "auto" else str(args.concurrency))
+            rows.append(("concurrency", conc +
                          (f" × {args.processes} processes"
                           if args.processes > 1 else ""), None))
         if out_path:
@@ -2883,8 +3059,7 @@ def main(argv=None):
     # crash keeps every finished target (in the --live file). The single-pool
     # path is used for one target, for --ct (needs the shared set), or for -P
     # multiprocess sharding.
-    per_target = (not args.no_scan and args.processes <= 1 and not args.ct
-                  and len(targets) > 1)
+    per_target = (not args.no_scan and not args.ct and len(targets) > 1)
 
     live = lame = wild = unresolved = total_generated = 0
     target_stats = []
@@ -2938,11 +3113,12 @@ def main(argv=None):
                         progress.update_target(_tc["done"], _tc["live"])
 
                     t_start = time.monotonic()
-                    run_scan(tp, processes=1, concurrency=args.concurrency,
-                             timeout=args.timeout, nameservers=nameservers,
-                             do_web=do_web, do_rdap=do_rdap,
-                             do_favicon=do_favicon, do_mx=do_mx, progress=None,
-                             on_result=_cb)
+                    tp = run_scan(tp, processes=max(1, args.processes),
+                                  concurrency=args.concurrency,
+                                  timeout=args.timeout, nameservers=nameservers,
+                                  do_web=do_web, do_rdap=do_rdap,
+                                  do_favicon=do_favicon, do_mx=do_mx,
+                                  progress=None, on_result=_cb)
                     tally(tp)
                     progress.set_counts(wild, lame, unresolved)
                     st = _target_stats(tp, idx=idx,
