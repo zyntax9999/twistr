@@ -281,10 +281,18 @@ Run `python twistr.py --list-fuzzers` to see this list with risk weights.
 | `cardinal` | Number ↔ word / leet swaps | `p4ypal.com` |
 | `tld-swap` | Same name, different TLD | `paypal.net`, `paypal.io` |
 | `tld-typo` | Typo of the real TLD (the `.cm`/`.co`/`.om` family) | `paypal.cm`, `paypal.co` |
+| `separator` | Hyphen/dot edits: drops or swaps separators a brand already has, and splits a compound brand into two extra words | `thenorthface.com` and `the.north.face.com` (from `the-north-face.com`), `north-face.com` |
+| `numeral` | Numbers and years appended or prepended, tracking the current year | `adidas2026.com`, `adidas-24.com`, `3adidas.com` |
+| `double-omission` | Two characters dropped (names of 6+ characters) | `nortace.com` |
+| `hosting` | Brand as a host on dynamic-DNS and free-hosting providers — a standard way to serve a phishing page with no registration at all | `paypal.duckdns.org`, `paypal.pages.dev` |
+| `wrong-sld` | Another second-level domain in the same ccTLD family | `brand.org.uk` (from `brand.co.uk`) |
+| `phonetic` | Common-misspelling swaps (`ph`↔`f`, `ck`↔`k`, `s`↔`z`) | `northphace.com`, `northfake.com` |
+| `reorder` | Letters swapped at a distance, not just adjacent ones | `ronthface.com` |
 | `various` | TLD-in-name, `www` noise, plurals | `paypalcom.com`, `wwwpaypal.com` |
 
-A special `homoglyph-script` sub-result produces whole-script IDN homographs
-(e.g. an all-Cyrillic look-alike that is visually identical to the original).
+A special `homoglyph-script` sub-result produces whole-script IDN homographs —
+Cyrillic, Greek and Armenian — where every letter maps into one alphabet, so
+the result is visually identical to the original.
 Results discovered via `--ct` are labelled `ct-log`.
 
 ---
@@ -356,7 +364,10 @@ shows the highlights):
   (`--ct`) — i.e. someone obtained a TLS certificate for it.
 - **`wildcard`** — `yes` if the name only "resolves" because its parent zone
   answers for *any* name (wildcard DNS). These are **excluded** from the
-  registered count but kept in the output so you can see them.
+  registered count but kept in the output so you can see them. This covers
+  catch-all hosting providers (`vercel.app`, `github.io`, `netlify.app` and
+  others answer for every name, even ones nobody claimed), which is why a
+  `hosting` result that survives is a host somebody really created.
 
 The end-of-run summary (on stderr) tells you about edge cases:
 
