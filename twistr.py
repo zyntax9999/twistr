@@ -336,9 +336,96 @@ def _idn_allowed(ascii_domain: str, tld: str) -> bool:
     return all(ch.isascii() or ch in allowed for ch in label)
 
 
+# Greek and Armenian look-alikes, used the same way as _CYRILLIC: if a whole
+# label maps, the result is visually identical but a different registration.
+_GREEK = {
+    "a": "\u03b1", "b": "\u03b2", "e": "\u03b5", "i": "\u03b9", "k": "\u03ba", "m": "\u03bc", "n": "\u03b7",
+    "o": "\u03bf", "p": "\u03c1", "r": "\u03b3", "t": "\u03c4", "u": "\u03c5", "v": "\u03bd", "x": "\u03c7",
+    "y": "\u03b3", "z": "\u03b6", "c": "\u03c2", "h": "\u03b7", "s": "\u03c3", "w": "\u03c9",
+}
+_ARMENIAN = {
+    "a": "\u0561", "b": "\u0562", "g": "\u0563", "d": "\u0564", "e": "\u0565", "h": "\u0570", "i": "\u056b",
+    "l": "\u056c", "n": "\u0576", "o": "\u0585", "p": "\u0570", "s": "\u057d", "t": "\u057f", "u": "\u0578",
+    "j": "\u0571", "q": "\u0584", "f": "\u0586", "m": "\u0574", "r": "\u0580", "k": "\u056f",
+}
+_SCRIPTS = (("cyrillic", _CYRILLIC), ("greek", _GREEK), ("armenian", _ARMENIAN))
+
+# Numbers that show up on fake-shop and campaign domains. Years are generated
+# relative to the current year, so the list never goes stale.
+_NUMERALS = ("1", "2", "3", "7", "01", "02", "24", "247", "365", "360", "100",
+             "123", "99", "2000")
+
+
+def _numeral_affixes():
+    year = datetime.now().year
+    years = [str(y) for y in range(year - 1, year + 3)]
+    years += [y[2:] for y in years]
+    seen, out = set(), []
+    for v in list(_NUMERALS) + years:
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
+# Dynamic-DNS and free-hosting suffixes. Phishing pages are routinely served
+# from <brand>.<provider>, which costs the attacker nothing and needs no
+# registration, so no permutation of the brand's own domain would ever find
+# them. A name here that resolves is a host somebody actually created.
+_HOSTING_SUFFIXES = (
+    # dynamic DNS
+    "duckdns.org", "no-ip.org", "no-ip.com", "ddns.net", "hopto.org",
+    "zapto.org", "serveo.net", "sytes.net", "myftp.org", "dynu.net",
+    "freeddns.org", "chickenkiller.com",
+    # free app / page hosting
+    "github.io", "pages.dev", "workers.dev", "netlify.app", "vercel.app",
+    "herokuapp.com", "web.app", "firebaseapp.com", "glitch.me", "repl.co",
+    "surge.sh", "onrender.com", "azurewebsites.net", "cloudfront.net",
+    # free site builders / blogs
+    "weebly.com", "wixsite.com", "blogspot.com", "000webhostapp.com",
+    "square.site", "godaddysites.com",
+    # tunnels, often used for short-lived phishing
+    "ngrok.io", "ngrok.app", "trycloudflare.com", "loca.lt",
+)
+
+# Second-level domains a ccTLD registry offers. A brand on co.uk is squatted
+# on org.uk; these are real, separate registrations (unlike a wrong TLD).
+_SLD_FAMILIES = {
+    "uk": ("co.uk", "org.uk", "me.uk", "ac.uk", "net.uk", "ltd.uk", "plc.uk"),
+    "au": ("com.au", "net.au", "org.au", "id.au", "asn.au"),
+    "nz": ("co.nz", "net.nz", "org.nz", "ac.nz", "geek.nz"),
+    "jp": ("co.jp", "ne.jp", "or.jp", "ac.jp", "gr.jp"),
+    "br": ("com.br", "net.br", "org.br", "ind.br"),
+    "cn": ("com.cn", "net.cn", "org.cn", "gov.cn"),
+    "za": ("co.za", "org.za", "net.za", "web.za"),
+    "in": ("co.in", "net.in", "org.in", "firm.in", "gen.in"),
+    "mx": ("com.mx", "org.mx", "net.mx"),
+    "tw": ("com.tw", "net.tw", "org.tw", "idv.tw"),
+    "kr": ("co.kr", "ne.kr", "or.kr", "re.kr"),
+    "il": ("co.il", "org.il", "net.il", "ac.il"),
+    "tr": ("com.tr", "net.tr", "org.tr", "biz.tr"),
+    "ar": ("com.ar", "net.ar", "org.ar"),
+    "ru": ("com.ru", "net.ru", "org.ru", "spb.ru"),
+    "pl": ("com.pl", "net.pl", "org.pl", "info.pl"),
+    "es": ("com.es", "org.es", "nom.es"),
+    "pt": ("com.pt", "org.pt", "net.pt"),
+}
+
+# Spelling / phonetic swaps behind "common misspelling" squats. Applied both
+# ways at every occurrence.
+_PHONETIC = (
+    ("ph", "f"), ("ck", "k"), ("c", "k"), ("s", "z"), ("ie", "ei"),
+    ("ee", "ea"), ("oo", "u"), ("ou", "o"), ("qu", "kw"), ("x", "ks"),
+    ("gh", "g"), ("tion", "sion"), ("ance", "ence"), ("able", "ible"),
+    ("y", "ie"), ("i", "y"), ("er", "or"), ("ll", "l"), ("mm", "m"),
+    ("nn", "n"), ("tt", "t"), ("ss", "s"),
+)
+
 # Fuzzers weighted by how convincing / dangerous the result usually is.
 _FUZZER_RISK = {
     "homoglyph": 5, "homoglyph-script": 6, "bitsquatting": 4, "dictionary": 4,
+    "separator": 4, "numeral": 3, "double-omission": 2,
+    "hosting": 5, "wrong-sld": 3, "phonetic": 3, "reorder": 2,
     "homophone": 3, "cardinal": 3, "tld-typo": 4, "hyphenation": 3,
     "subdomain": 3, "omission": 3, "replacement": 3, "insertion": 2,
     "transposition": 2, "repetition": 2, "vowel-swap": 2, "addition": 2,
@@ -417,6 +504,8 @@ class Permutation:
     registrar: str | None = None
     ct: bool = False               # seen in a Certificate Transparency log
     wildcard: bool = False         # only answers like a parent-zone wildcard
+    deep: bool = False             # extra dot: a host under a domain we do
+                                   # not control, not a registration of its own
     risk: int = 0
 
     @property
@@ -471,7 +560,8 @@ class DomainFuzzer:
         self._check_ctr = 0
 
     # -- helpers ---------------------------------------------------------- #
-    def _add(self, fuzzer: str, new_name: str, tld: str | None = None):
+    def _add(self, fuzzer: str, new_name: str, tld: str | None = None,
+             deep: bool | None = None):
         tld = tld or self.tld
         unicode_domain = f"{new_name}.{tld}"
         if unicode_domain == self.original or unicode_domain in self._seen:
@@ -506,7 +596,8 @@ class DomainFuzzer:
         self._seen.add(ascii_domain)
         self.results.append(
             Permutation(fuzzer, unicode_domain, ascii_domain,
-                        target=self.original)
+                        target=self.original,
+                        deep=("." in new_name) if deep is None else deep)
         )
         # periodic guard so a giant dictionary can't OOM-kill the process:
         # stop generating (and scan what we have) when a cap is reached
@@ -558,6 +649,7 @@ class DomainFuzzer:
         n = self.name
         for c in "abcdefghijklmnopqrstuvwxyz0123456789":
             self._add("addition", n + c)
+            self._add("addition", c + n)
 
     def _vowel_swap(self):
         n = self.name
@@ -610,12 +702,13 @@ class DomainFuzzer:
         for r in first:
             for r2 in mix(r):
                 self._add("homoglyph", r2)
-        # whole-script confusable: if every letter maps to a Cyrillic look-alike
-        # the result is visually identical to the original (strong IDN attack)
-        if n and all(c in _CYRILLIC or c in "-" for c in n) and any(
-                c in _CYRILLIC for c in n):
-            self._add("homoglyph-script",
-                      "".join(_CYRILLIC.get(c, c) for c in n))
+        # whole-script confusables: if every letter of the label maps into one
+        # alphabet, the result is visually identical but a separate domain
+        for _script, table in _SCRIPTS:
+            if n and all(c in table or c in "-." for c in n) and any(
+                    c in table for c in n):
+                self._add("homoglyph-script",
+                          "".join(table.get(c, c) for c in n))
 
     def _dictionary(self):
         n = self.name
@@ -656,6 +749,91 @@ class DomainFuzzer:
             self._add("various", n[:-1])
         else:
             self._add("various", n + "s")
+
+    def _separator(self):
+        """Hyphen/dot edits. Brands that already contain a separator are
+        squatted by dropping or swapping it (the-north-face -> thenorthface,
+        the.north.face); brands that do not are squatted by splitting them
+        into more than one word, which single-hyphen insertion cannot do."""
+        n = self.name
+        seps = [i for i, c in enumerate(n) if c in "-."]
+        if seps:
+            for i in seps:                       # drop one separator
+                self._add("separator", n[:i] + n[i + 1:])
+                other = "." if n[i] == "-" else "-"
+                self._add("separator", n[:i] + other + n[i + 1:])
+            if len(seps) > 1:                    # drop / swap all of them
+                self._add("separator", "".join(c for c in n if c not in "-."))
+                for sep in ("-", "."):
+                    self._add("separator",
+                              "".join(sep if c in "-." else c for c in n))
+        # split into two extra words: covers the-north-face from thenorthface,
+        # which the single-hyphen 'hyphenation' fuzzer can never reach
+        if not seps and 4 <= len(n) <= 24:
+            for i in range(1, len(n)):
+                for j in range(i + 1, len(n)):
+                    for sep in ("-", "."):
+                        self._add("separator",
+                                  n[:i] + sep + n[i:j] + sep + n[j:])
+
+    def _numeral(self):
+        """Numbers and years appended or prepended - the signature of
+        fake-shop and seasonal campaign domains (brand2026, brand-24)."""
+        n = self.name
+        for v in _numeral_affixes():
+            self._add("numeral", f"{n}{v}")
+            self._add("numeral", f"{n}-{v}")
+            self._add("numeral", f"{v}{n}")
+            self._add("numeral", f"{v}-{n}")
+
+    def _double_omission(self):
+        """Two characters dropped: common in long brand names, where one
+        missing letter is often accompanied by another."""
+        n = self.name
+        if len(n) < 6:
+            return
+        for i in range(len(n)):
+            for j in range(i + 1, len(n)):
+                self._add("double-omission", n[:i] + n[i + 1:j] + n[j + 1:])
+
+    def _hosting(self):
+        """<brand>.<dynamic-DNS or free-hosting provider>. Costs an attacker
+        nothing, needs no registration, and is a standard way to serve a
+        phishing page - so no permutation of the brand's own domain finds it."""
+        for suffix in _HOSTING_SUFFIXES:
+            if not self.original.endswith("." + suffix):
+                # a host under somebody else's domain, not a registration
+                self._add("hosting", self.name, tld=suffix, deep=True)
+
+    def _wrong_sld(self):
+        """Another second-level domain in the same ccTLD family: a brand on
+        co.uk squatted on org.uk. Unlike a wrong TLD these are separate, real
+        registrations under the same registry."""
+        last = self.tld.rsplit(".", 1)[-1]
+        for sld in _SLD_FAMILIES.get(last, ()):
+            if sld != self.tld:
+                self._add("wrong-sld", self.name, tld=sld)
+
+    def _phonetic(self):
+        """Common-misspelling squats: spelling and sound swaps such as
+        ph/f and ck/k, applied in both directions."""
+        n = self.name
+        for a, b in _PHONETIC:
+            for src, dst in ((a, b), (b, a)):
+                start = 0
+                while (pos := n.find(src, start)) != -1:
+                    self._add("phonetic", n[:pos] + dst + n[pos + len(src):])
+                    start = pos + 1
+
+    def _reorder(self):
+        """Letters swapped at a distance, not just adjacent ones - the
+        'change order' typo that transposition alone cannot produce."""
+        n = self.name
+        for i in range(len(n)):
+            for j in range(i + 2, min(i + 5, len(n))):
+                if n[i] != n[j]:
+                    self._add("reorder",
+                              n[:i] + n[j] + n[i + 1:j] + n[i] + n[j + 1:])
 
     def _tld_typo(self):
         t = self.tld
@@ -701,6 +879,9 @@ class DomainFuzzer:
         "subdomain": _subdomain, "bitsquatting": _bitsquatting,
         "homoglyph": _homoglyph, "dictionary": _dictionary,
         "homophone": _homophone, "cardinal": _cardinal,
+        "separator": _separator, "numeral": _numeral,
+        "double-omission": _double_omission, "hosting": _hosting,
+        "wrong-sld": _wrong_sld, "phonetic": _phonetic, "reorder": _reorder,
         "tld-swap": _tld_swap, "tld-typo": _tld_typo, "various": _various,
     }
 
@@ -1616,10 +1797,13 @@ class Scanner:
         perm.dns_cname = sorted(cnames)
         perm.wildcard = False
         if perm.dns_a or perm.dns_ns or perm.dns_cname:
-            wa, wn, wc = await self._wildcard_addrs(perm.ascii.split(".", 1)[1])
-            if wa or wn or wc:
+            wa, wn, wc, catch_all = await self._wildcard_addrs(
+                perm.ascii.split(".", 1)[1])
+            ns_same = {n.lower() for n in perm.dns_ns} == wn
+            if catch_all and ns_same:
+                perm.wildcard = True        # zone answers for any name
+            elif wa or wn or wc:
                 a_same = bool(set(perm.dns_a) & wa) if perm.dns_a else not wa
-                ns_same = {n.lower() for n in perm.dns_ns} == wn
                 c_same = {c.lower() for c in perm.dns_cname} == wc
                 perm.wildcard = a_same and ns_same and c_same
         # name exists but we could not confirm anything -> worth a retry
@@ -1637,21 +1821,29 @@ class Scanner:
         try:
             return await asyncio.shield(fut)
         except Exception:
-            return set(), set(), set()
+            return set(), set(), set(), False
 
     async def _probe_wild(self, parent):
         addrs, ns, cn = set(), set(), set()
-        for _ in range(2):                  # two random labels, union of answers
+        answered = probes = 0
+        for _ in range(3):                  # random labels, union of answers
             name = "zq" + "".join(random.choices(
                 string.ascii_lowercase + string.digits, k=14)) + "." + parent
+            probes += 1
             st, vals, c = await self._query(name, "A", 3)
             if st == "nx":
                 break                       # no wildcard in this zone
-            addrs.update(vals or [])
+            if vals:
+                answered += 1
+                addrs.update(vals)
             cn.update(x.lower() for x in (c or []))
             st, vals, c = await self._query(name, "NS", 3)
             ns.update(v.lower() for v in (vals or []))
-        return addrs, ns, cn
+        # a zone that answers for every random name answers for anything, so a
+        # candidate resolving there is no evidence at all. Catching this by
+        # address alone fails on hosts that rotate IPs (vercel, netlify, ...).
+        catch_all = probes >= 2 and answered == probes
+        return addrs, ns, cn, catch_all
 
     async def _resolve_socket(self, perm: Permutation):
         loop = asyncio.get_running_loop()
@@ -1959,7 +2151,8 @@ class Scanner:
                             continue
                         # never a definitive answer, but SERVFAIL while the
                         # resolver was idle -> lame delegation (registered)
-                        if st in ("servfail", "fail") and getattr(p, "_sf", False):
+                        if (st in ("servfail", "fail")
+                                and getattr(p, "_sf", False) and not p.deep):
                             p._dns = "servfail"
                             p.dns_ns = ["!servfail"]
                             p.risk = score(p)
