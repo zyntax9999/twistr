@@ -1720,6 +1720,14 @@ class _Gate:
                 fut.set_result(None)
 
 
+# Wildcard probe results, keyed by parent zone, kept for the life of the
+# process. Each target used to build its own Scanner and re-probe the same
+# parents (the 36 hosting providers above, and every TLD), which on a list of
+# brands is thousands of wasted lookups against names that do not exist.
+_WILD_CACHE = {}
+_WILD_CACHE_MAX = 20000
+
+
 # the concurrency the adaptive controller settled on, carried from one target
 # (and one Scanner) to the next so each target does not start slow again
 _LEARNED = {"limit": None}
@@ -1846,7 +1854,10 @@ class Scanner:
         if ns:
             perm.dns_ns = ns
         cnames = set(cn or [])
-        qtypes = ["A", "AAAA"] + (["MX"] if self.do_mx else [])
+        # AAAA is asked for only when A came back empty: an address of either
+        # family proves the same thing, and almost every live name has an A
+        # record, so this drops a query for most names that exist.
+        qtypes = ["A"] + (["MX"] if self.do_mx else [])
         results = await asyncio.gather(
             *[self._query(perm.ascii, t, attempts) for t in qtypes])
         failed = False
@@ -1858,10 +1869,15 @@ class Scanner:
                 continue
             if rtype == "A":
                 perm.dns_a = vals
-            elif rtype == "AAAA":
-                perm.dns_aaaa = vals
             else:
                 perm.dns_mx = vals
+        if not perm.dns_a and not cnames:
+            s6, v6, cn6 = await self._query(perm.ascii, "AAAA", attempts)
+            cnames.update(cn6 or [])
+            if s6 in ("servfail", "fail"):
+                failed = True
+            if v6:
+                perm.dns_aaaa = v6
         # a name that exists only because its parent zone answers for *any*
         # name (wildcard DNS) is not a registration: no delegation of its own
         # and the same addresses as a random name in that zone
@@ -1885,14 +1901,22 @@ class Scanner:
         """(addresses, nameservers) a random label under `parent` gets - both
         empty if the zone has no wildcard. Probed once per zone and cached;
         concurrent callers share the same probe."""
+        hit = _WILD_CACHE.get(parent)
+        if hit is not None:
+            return hit
+        # in-flight probes are shared within this event loop; finished ones are
+        # shared with every later target through _WILD_CACHE
         cache = self.__dict__.setdefault("_wild", {})
         fut = cache.get(parent)
         if fut is None:
             fut = cache[parent] = asyncio.ensure_future(self._probe_wild(parent))
         try:
-            return await asyncio.shield(fut)
+            result = await asyncio.shield(fut)
         except Exception:
             return set(), set(), set(), False
+        if len(_WILD_CACHE) < _WILD_CACHE_MAX:
+            _WILD_CACHE[parent] = result
+        return result
 
     async def _probe_wild(self, parent):
         addrs, ns, cn = set(), set(), set()
