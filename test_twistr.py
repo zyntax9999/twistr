@@ -184,6 +184,86 @@ def test_dictionary_trim_samples_across_the_whole_list():
     assert fz.trim_note
 
 
+def test_separator_reaches_forms_single_hyphen_insertion_cannot():
+    """Gap: 'hyphenation' only inserts one hyphen, so a hyphenated brand could
+    never reach its unhyphenated form, and a compound brand could never reach
+    a two-word split."""
+    hyph = {p.ascii for p in twistr.DomainFuzzer("the-north-face.com").generate()}
+    assert {"thenorthface.com", "the.north.face.com"} <= hyph
+    comp = {p.ascii for p in twistr.DomainFuzzer("northface.com").generate()}
+    assert {"north-face.com", "north.face.com"} <= comp
+
+
+def test_numeral_affixes_track_the_current_year():
+    """Fake shops lean on years; a hard-coded list would go stale."""
+    from datetime import datetime
+    year = str(datetime.now().year)
+    out = {p.ascii for p in twistr.DomainFuzzer("brand.com").generate(["numeral"])}
+    assert f"brand{year}.com" in out
+    assert f"brand-{year}.com" in out
+    assert f"{year}brand.com" in out
+    assert "brand24.com" in out
+
+
+def test_double_omission_needs_a_long_enough_name():
+    short = {p.fuzzer for p in twistr.DomainFuzzer("abc.com").generate(
+        ["double-omission"])}
+    assert "double-omission" not in short
+    long_ = {p.ascii for p in twistr.DomainFuzzer("northface.com").generate(
+        ["double-omission"])}
+    assert "nortace.com" in long_            # two letters gone, not one
+
+
+def test_whole_script_covers_more_than_cyrillic():
+    out = [p.domain for p in twistr.DomainFuzzer("shop.com").generate(
+        ["homoglyph"]) if p.fuzzer == "homoglyph-script"]
+    assert len(out) >= 2                      # cyrillic + greek/armenian
+    assert all(d.endswith(".com") and not d.isascii() for d in out)
+
+
+def test_addition_prefixes_as_well_as_suffixes():
+    out = {p.ascii for p in twistr.DomainFuzzer("brand.com").generate(
+        ["addition"])}
+    assert "brands.com" in out and "xbrand.com" in out
+
+
+def test_hosting_fuzzer_targets_providers_not_registrations():
+    """Phishing is routinely served from <brand>.<free host>; no permutation
+    of the brand's own domain can reach those."""
+    out = [p for p in twistr.DomainFuzzer("northface.com").generate(["hosting"])
+           if p.fuzzer == "hosting"]
+    names = {p.ascii for p in out}
+    assert "northface.duckdns.org" in names and "northface.pages.dev" in names
+    assert all(p.deep for p in out)        # hosts under somebody else's domain
+
+
+def test_wrong_sld_stays_inside_the_cctld_family():
+    out = {p.ascii for p in twistr.DomainFuzzer("brand.co.uk").generate(
+        ["wrong-sld"]) if p.fuzzer == "wrong-sld"}
+    assert {"brand.org.uk", "brand.ac.uk"} <= out
+    assert "brand.co.uk" not in out          # never the original itself
+    assert all(d.endswith(".uk") for d in out)
+    # a TLD with no second-level family produces nothing
+    assert not [p for p in twistr.DomainFuzzer("brand.com").generate(
+        ["wrong-sld"]) if p.fuzzer == "wrong-sld"]
+
+
+def test_phonetic_swaps_run_both_directions():
+    out = {p.ascii for p in twistr.DomainFuzzer("northface.com").generate(
+        ["phonetic"])}
+    assert "northphace.com" in out          # f  -> ph
+    assert "northfake.com" in out           # c  -> k
+    assert "grafics.com" in {p.ascii for p in twistr.DomainFuzzer(
+        "graphics.com").generate(["phonetic"])}   # ph -> f
+
+
+def test_reorder_swaps_non_adjacent_letters():
+    out = {p.ascii for p in twistr.DomainFuzzer("northface.com").generate(
+        ["reorder"])}
+    assert "ronthface.com" in out           # n and r swapped at distance 2
+    assert "nortface.com" not in out        # that is an omission, not a swap
+
+
 def test_generation_is_deterministic():
     a = [p.ascii for p in twistr.DomainFuzzer("paypal.com").generate()]
     b = [p.ascii for p in twistr.DomainFuzzer("paypal.com").generate()]
@@ -244,6 +324,62 @@ def test_wildcard_zone_is_not_a_registration():
     p = perm(ascii_="anything.co.com", domain="anything.co.com")
     scan_with(zone, [p], wildcard_parents={"co.com"})
     assert p.wildcard and not p.registered
+
+
+def test_servfail_on_a_deep_name_is_not_a_registration():
+    """Bug: a broken parent zone (face.com SERVFAILs) made every generated
+    host under it - nort.h.face.com and friends - look registered. Only a
+    registrable name can be a lame delegation."""
+    zone = {"n.orth.face.com": "servfail"}
+    p = perm(ascii_="n.orth.face.com", domain="n.orth.face.com")
+    p.deep = True
+    scan_with(zone, [p])
+    assert not p.registered and p.dns_ns != ["!servfail"]
+
+
+def test_deep_flag_is_set_for_dot_inserting_fuzzers():
+    perms = twistr.DomainFuzzer("northface.com").generate(
+        ["subdomain", "separator", "omission"])
+    assert all(p.deep for p in perms if "." in p.ascii[:-4] and p.fuzzer
+               in ("subdomain", "separator"))
+    assert not any(p.deep for p in perms if p.fuzzer == "omission")
+
+
+def test_catch_all_zone_is_detected_even_when_it_rotates_addresses():
+    """Bug: hosting providers that answer for every name (vercel, netlify,
+    github.io) return a different address each time, so comparing addresses
+    missed them and every <brand>.<provider> looked claimed."""
+    class Rotating(FakeResolver):
+        def __init__(self):
+            super().__init__({})
+            self.n = 0
+
+        async def _query(self, name, rtype):
+            if not name.endswith(".rotate.app"):
+                raise _ares_error(4, "Domain name not found")
+            if rtype != "A":
+                raise _ares_error(1, "no data")
+            self.n += 1                     # never the same address twice
+            return FakeResult([FakeRecord(name, 1, addr=f"10.0.0.{self.n}")])
+
+    sc = twistr.Scanner(concurrency=4, timeout=0.2)
+
+    def use(timeout):
+        sc._resolver = Rotating()
+        sc._qfn = sc._resolver.query_dns
+    sc._use_resolver = use
+    p = perm(ascii_="brand.rotate.app", domain="brand.rotate.app")
+    p.deep = True
+    asyncio.run(sc.scan([p], progress=None, prime=False))
+    assert p.wildcard and not p.registered
+
+
+def test_a_real_claim_on_a_non_wildcard_host_is_kept():
+    zone = {"brand.pages.dev": {"A": ["1.2.3.4"]}}
+    p = perm(ascii_="brand.pages.dev", domain="brand.pages.dev")
+    p.deep = True
+    scan_with(zone, [p])
+    assert p.registered and not p.wildcard
 
 
 def test_persistent_servfail_is_a_lame_delegation():
