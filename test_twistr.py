@@ -389,6 +389,58 @@ def test_persistent_servfail_is_a_lame_delegation():
     assert p.dns_ns == ["!servfail"] and p.registered
 
 
+def test_aaaa_is_skipped_when_an_a_record_answers():
+    """AAAA proves the same thing as A, so asking for both on every live name
+    is a wasted query; it is still asked when A comes back empty."""
+    zone = {"has-a.com": {"NS": ["ns"], "A": ["1.2.3.4"]},
+            "v6only.com": {"NS": ["ns"], "AAAA": ["2001:db8::1"]}}
+    a, b = perm(ascii_="has-a.com", domain="has-a.com"), \
+        perm(ascii_="v6only.com", domain="v6only.com")
+    sc = twistr.Scanner(concurrency=4, timeout=0.2)
+    res = FakeResolver(zone)
+
+    def use(timeout):
+        sc._resolver = res
+        sc._qfn = res.query_dns
+    sc._use_resolver = use
+    asyncio.run(sc.scan([a, b], progress=None, prime=False))
+    asked = [n for n, t in res.calls if t == "AAAA"]
+    assert "has-a.com" not in asked          # A answered, no need
+    assert "v6only.com" in asked             # A empty, so ask
+    assert a.registered and b.registered and b.dns_aaaa == ["2001:db8::1"]
+
+
+def test_wildcard_probe_is_cached_across_targets():
+    """Each target builds its own Scanner; without a process-wide cache the
+    same parent zones are re-probed for every target in a list."""
+    twistr._WILD_CACHE.clear()
+    zone = {}
+    calls = []
+
+    def scan_one(name):
+        sc = twistr.Scanner(concurrency=4, timeout=0.2)
+
+        def use(timeout):
+            r = FakeResolver(zone, wildcard_parents={"catchall.test"})
+            sc._resolver = r
+            sc._qfn = r.query_dns
+            calls.append(r)
+        sc._use_resolver = use
+        p = perm(ascii_=f"{name}.catchall.test", domain=f"{name}.catchall.test")
+        p.deep = True
+        asyncio.run(sc.scan([p], progress=None, prime=False))
+        return p
+
+    first = scan_one("brand1")
+    probes_after_first = sum(len(r.calls) for r in calls)
+    second = scan_one("brand2")
+    probes_after_second = sum(len(r.calls) for r in calls)
+    assert first.wildcard and second.wildcard
+    # the second target must not repeat the probe work of the first
+    assert (probes_after_second - probes_after_first) < probes_after_first
+    twistr._WILD_CACHE.clear()
+
+
 def test_mx_is_only_queried_when_asked():
     zone = {"m.com": {"NS": ["ns"], "A": ["1.1.1.1"], "MX": ["mx.m"]}}
     p = perm(ascii_="m.com", domain="m.com")
@@ -645,6 +697,46 @@ def test_target_stats_picks_the_highest_risk_find():
           perm(ascii_="b.com", domain="b.com", risk=90, dns_a=["1"])]
     st = twistr._target_stats(tp, idx=1, secs=2.0)
     assert st["live"] == 2 and st["top"].ascii == "b.com" and st["high"] == 1
+
+
+def test_severity_label_accompanies_every_risk_colour():
+    """Colour alone fails a colour-blind reader, a mono terminal and a log
+    file, so every risk also carries a word."""
+    assert twistr._severity(95)[0] == "HIGH"
+    assert twistr._severity(70)[0] == "HIGH"
+    assert twistr._severity(69)[0] == "MED"
+    assert twistr._severity(45)[0] == "MED"
+    assert twistr._severity(44)[0] == "LOW"
+    assert all(twistr._severity(r)[1] for r in (0, 50, 100))
+
+
+def test_signals_explain_the_score():
+    """The 'why' column: a row should be judgeable without opening the CSV."""
+    p = perm(dns_a=["1.2.3.4"], dns_mx=["mx"], age_days=9, fuzzy=87,
+             favicon_match=True, http_status=200, ct=True,
+             title="Example Login", target="example.com")
+    why = twistr._signals(p)
+    for expected in ("live", "mail", "new 9d", "clone 87%", "same favicon",
+                     "http 200", "cert", "brand in title"):
+        assert expected in why, f"{expected!r} missing from {why!r}"
+    assert twistr._signals(perm()) == ""          # nothing resolved, no claims
+    assert "lame-ns" in twistr._signals(perm(dns_ns=["!servfail"]))
+    assert "alias" in twistr._signals(perm(dns_cname=["x.bodis.com"]))
+
+
+def test_next_step_hint_only_suggests_work_not_already_done():
+    reg = [perm(dns_a=["1.2.3.4"])]
+    assert "--all-checks" in twistr._next_step_hint(set(), reg)
+    assert "--ct" in twistr._next_step_hint({"web", "rdap", "mx"}, reg)
+    assert twistr._next_step_hint({"web", "rdap", "mx", "ct"}, reg) == ""
+    assert twistr._next_step_hint(set(), []) == ""      # nothing found, no hint
+
+
+def test_top_option_limits_the_findings_list(tmp_path, capsys):
+    out = tmp_path / "o.txt"
+    rc = twistr.main(["example.com", "--no-scan", "--fuzzers", "omission",
+                      "--format", "domains", "-o", str(out), "--top", "3"])
+    assert rc == 0
 
 
 def test_every_preset_is_valid_and_focused():
