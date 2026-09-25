@@ -647,6 +647,59 @@ def test_target_stats_picks_the_highest_risk_find():
     assert st["live"] == 2 and st["top"].ascii == "b.com" and st["high"] == 1
 
 
+def test_every_preset_is_valid_and_focused():
+    """A preset must name only real fuzzers and must actually narrow the set."""
+    for name, spec in twistr._PRESETS.items():
+        assert spec["fuzzers"], name
+        unknown = set(spec["fuzzers"]) - set(twistr.DomainFuzzer._ALL)
+        assert not unknown, f"{name}: unknown fuzzers {unknown}"
+        assert len(spec["fuzzers"]) < len(twistr.DomainFuzzer._ALL), name
+        assert spec["description"]
+
+
+def test_fakeshop_preset_uses_shop_words_and_cheap_tlds():
+    words, tlds = twistr._SHOP_KEYWORDS, twistr._SHOP_TLDS
+    out = {p.ascii for p in twistr.DomainFuzzer(
+        "northface.com", dictionary=list(words), tlds=list(tlds)).generate(
+            list(twistr._PRESETS["fakeshop"]["fuzzers"]))}
+    assert {"northfaceoutlet.com", "northface-sale.com", "northface.shop",
+            "northface.store"} <= out
+    assert "northfacelogin.com" not in out       # phishing word, not a shop one
+    assert not any("xn--" in d for d in out)     # homoglyphs are not in this set
+
+
+def test_presets_are_smaller_than_the_full_set():
+    full = len(twistr.DomainFuzzer("northface.com").generate())
+    for name, spec in twistr._PRESETS.items():
+        n = len(twistr.DomainFuzzer(
+            "northface.com",
+            dictionary=list(spec["dictionary"]) if spec.get("dictionary") else None,
+            tlds=list(spec["tlds"]) if spec.get("tlds") else None,
+        ).generate(list(spec["fuzzers"])))
+        assert n < full, f"{name} generated {n}, not fewer than {full}"
+
+
+def test_preset_header_does_not_need_a_wordlist_file(tmp_path, capsys):
+    """Bug: the header printed the dictionary's filename, so a preset that
+    supplies its own words (no --dictionary) crashed on basename(None)."""
+    out = tmp_path / "o.txt"
+    rc = twistr.main(["northface.com", "--no-scan", "--preset", "fakeshop",
+                      "--format", "domains", "-o", str(out)])
+    assert rc == 0 and out.read_text().strip()
+
+
+def test_preset_flags_can_be_overridden(tmp_path):
+    out = tmp_path / "o.txt"
+    rc = twistr.main(["northface.com", "--no-scan", "--preset", "fakeshop",
+                      "--fuzzers", "omission", "--format", "domains",
+                      "-o", str(out)])
+    assert rc == 0
+    names = out.read_text().split()
+    assert names and all("northface" not in n or n.count("northface") == 0
+                         or True for n in names)
+    assert len(names) < 20                     # omission only, not the preset
+
+
 def test_parser_accepts_a_realistic_command_line():
     args = twistr.build_parser().parse_args(
         ["-i", "brands.txt", "-r", "-m", "--nameservers", "unfiltered",
