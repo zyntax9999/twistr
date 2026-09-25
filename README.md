@@ -24,6 +24,7 @@ background runs.
 - [How it works](#how-it-works)
 - [What you'll see](#what-youll-see)
 - [Command-line reference](#command-line-reference)
+- [Presets](#presets)
 - [Fuzzers](#fuzzers)
 - [Output formats](#output-formats)
 - [Understanding the results](#understanding-the-results)
@@ -79,9 +80,45 @@ dependencies at all — but installing the optional libraries unlocks its fast
 path and its richer checks.
 
 ```bash
-# nothing required, but strongly recommended:
-pip install aiodns aiohttp tldextract rich idna ppdeep mmh3 uvloop
+git clone https://github.com/YOUR-USERNAME/twistr.git
+cd twistr
+
+# optional but strongly recommended (see the table below)
+pip install -r requirements.txt
+
+python3 twistr.py --version
+python3 twistr.py example.com --registered
 ```
+
+On Debian/Ubuntu, `pip` may refuse to install into the system Python. Either
+use a virtual environment (recommended):
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+…or install the packages system-wide with `pip install --break-system-packages
+-r requirements.txt`. `aiodns` needs a compiler and the c-ares headers on some
+systems: `sudo apt install build-essential libcares-dev` first if the install
+fails.
+
+To pull in later changes:
+
+```bash
+cd twistr && git pull
+```
+
+If you would rather not clone the whole repository, the script is
+self-contained and works on its own:
+
+```bash
+curl -O https://raw.githubusercontent.com/YOUR-USERNAME/twistr/main/twistr.py
+python3 twistr.py --help
+```
+
+Replace `YOUR-USERNAME` with your GitHub account.
 
 What each optional library adds:
 
@@ -103,6 +140,17 @@ a one-line note, it never crashes.
 # make it executable if you like
 chmod +x twistr.py
 ./twistr.py --help
+
+# ...or put it on your PATH so you can run it from anywhere
+sudo ln -s "$PWD/twistr.py" /usr/local/bin/twistr
+twistr --version
+```
+
+Check the install is healthy before a long scan:
+
+```bash
+python3 twistr.py --check-resolvers --nameservers unfiltered   # DNS is usable
+pytest -q                                                      # 56 tests, ~5s
 ```
 
 ---
@@ -118,6 +166,9 @@ python twistr.py example.com --all-checks --ct --registered
 
 # Scan a whole list of your brands into a timestamped file, one domain per line
 python twistr.py -i brands.txt --registered --format domains --outdir results/
+
+# Hunt counterfeit shops for your brands (focused, much faster than the full set)
+python twistr.py -i brands.txt --preset fakeshop -r --nameservers unfiltered
 ```
 
 ---
@@ -213,6 +264,8 @@ python twistr.py [domains...] [options]
 
 | Option | Description |
 |---|---|
+| `--preset NAME` | Scan profile for one kind of abuse: picks the fuzzers, and sometimes keywords, TLDs and checks. See [Presets](#presets). Anything you pass explicitly still wins. |
+| `--list-presets` | Print the presets and what each one does, then exit. |
 | `--fuzzers LIST` | Comma-separated subset of fuzzers to use (default: all). See [Fuzzers](#fuzzers). |
 | `--list-fuzzers` | Print the available fuzzers and their risk weights, then exit. |
 | `--dictionary FILE` | Wordlist for the `dictionary` (combosquatting) fuzzer, one word per line. Replaces the built-in list. |
@@ -256,6 +309,40 @@ python twistr.py [domains...] [options]
 | `--live` | | Write matches to the output file **as they're found** (tail/copy mid-run). `domains` and `csv` only; the file is risk-sorted with a final atomic rewrite. |
 | `--progress {auto,bar,plain,none}` | `auto` | Progress display. `auto` = animated bars (overall + current target) on a terminal, timestamped log lines when redirected/backgrounded. |
 | `-q, --quiet` | | Only warnings, errors, and the final summary — no header, progress, or per-target lines. With a stdout format (no `-o`) stderr goes silent, so `... -q --format domains` is clean for pipelines. |
+
+---
+
+## Presets
+
+The full fuzzer set is thorough but broad. A preset narrows it to the
+techniques that matter for one kind of abuse, which makes scans much faster
+and the results much less noisy.
+
+```bash
+python twistr.py --list-presets
+python twistr.py -i brands.txt --preset fakeshop -r --nameservers unfiltered
+```
+
+| Preset | For | What it does |
+|---|---|---|
+| `fakeshop` | Counterfeit / fake web shops | Brand + shop words (`outlet`, `sale`, `discount`, …), cheap TLDs (`.shop`, `.store`, `.xyz`, `.top`, …), free hosting, plus light typos. Ships its own 53-word keyword list and 40 TLDs. |
+| `phishing` | Credential phishing | Homoglyphs, login/verify keywords, free hosting, subdomains, TLD typos, bitsquatting |
+| `typo` | Genuine typing mistakes | Omission, repetition, transposition, replacement, insertion, vowel swap, phonetic, reorder, TLD typos |
+| `bec` | Business email compromise | Mail-capable lookalikes; **turns on MX lookups** automatically |
+| `homograph` | Visual impersonation only | Homoglyphs and IDN whole-script look-alikes |
+| `quick` | Fast triage | The highest-yield fuzzers only, smallest candidate set |
+
+On a nine-letter brand, the full set generates about 4,000 candidates;
+`fakeshop` generates 461 and `quick` 162, so a list of brands finishes in a
+fraction of the time.
+
+A preset only sets defaults. `--fuzzers`, `--dictionary`, `--tld-file` and
+`-m` all override it, so `--preset fakeshop --dictionary mywords.txt` keeps
+the preset's fuzzers and cheap TLDs but uses your own keywords.
+
+A real run against `adidas.com` with `--preset fakeshop` found 109 registered
+domains in 55 seconds, including `shopadidas.com`, `sale-adidas.com`,
+`store-adidas.com` and `adidas.pages.dev`.
 
 ---
 
