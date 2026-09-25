@@ -80,7 +80,7 @@ dependencies at all — but installing the optional libraries unlocks its fast
 path and its richer checks.
 
 ```bash
-git clone https://github.com/zyntax9999/twistr.git
+git clone https://github.com/YOUR-USERNAME/twistr.git
 cd twistr
 
 # optional but strongly recommended (see the table below)
@@ -114,7 +114,7 @@ If you would rather not clone the whole repository, the script is
 self-contained and works on its own:
 
 ```bash
-curl -O https://raw.githubusercontent.com/zyntax9999/twistr/main/twistr.py
+curl -O https://raw.githubusercontent.com/YOUR-USERNAME/twistr/main/twistr.py
 python3 twistr.py --help
 ```
 
@@ -228,9 +228,29 @@ Each finished target leaves a line above the dashboard:
 done [7/29] northface-sale.com  12 live  299,999 checked  2:05 (2,399/s)  top northface-sale.shop (72)
 ```
 
-At the end you get a **results** panel: totals and risk mix (high/medium/low),
-DNS notes, findings by fuzzer, the output file, a **per-target table**, and the
-**top findings** across all targets with where each one resolves to.
+At the end you get a **results** panel: totals and risk mix, DNS notes,
+findings by fuzzer, the output file, a **per-target table**, and the **top
+findings** across all targets — each with a severity word, the reasons behind
+its score, and where it resolves:
+
+```
+top findings
+  risk            domain                   fuzzer      why           resolves to
+    76    HIGH    paypal.freeddns.org      hosting     live, mail    158.255.215.59
+    71    HIGH    paypal.net               tld-typo    live, mail    3.33.139.32
+    60    MED     paypal.pages.dev         hosting     live          172.66.47.115
+    43    LOW     paypal.workers.dev       hosting     delegated     ns doug.ns.cloudflare.com
+  … and 54 more in the output  (--top 50 to see more)
+  risk  HIGH >=70   MED 45-69   LOW <45
+  next  re-run the hits with --all-checks to add registration age, page content
+```
+
+The **why** column is the reason behind the number — `live`, `mail`,
+`new 9d`, `clone 87%`, `same favicon`, `cert`, `brand in title` — so a row can
+be judged without opening the CSV. Severity is a **word as well as a colour**,
+so the ranking survives a colour-blind reader, a mono terminal and a log file.
+The **next** line suggests the cheapest thing that would sharpen the results,
+and only ever suggests checks that did not already run. `--top N` lists more.
 
 **Under `nohup` or when redirected to a file**, the same information is written
 as plain timestamped lines (no colours or cursor codes), so `tail -f` works:
@@ -307,6 +327,7 @@ python twistr.py [domains...] [options]
 | `--outdir DIR` | | Write to DIR with an auto, timestamped, unique filename. |
 | `--timestamp` | | Add a date-time stamp to the output filename so each run is unique. |
 | `--live` | | Write matches to the output file **as they're found** (tail/copy mid-run). `domains` and `csv` only; the file is risk-sorted with a final atomic rewrite. |
+| `--top N` | `15` | How many findings to list in the end-of-run summary. |
 | `--progress {auto,bar,plain,none}` | `auto` | Progress display. `auto` = animated bars (overall + current target) on a terminal, timestamped log lines when redirected/backgrounded. |
 | `-q, --quiet` | | Only warnings, errors, and the final summary — no header, progress, or per-target lines. With a stdout format (no `-o`) stderr goes silent, so `... -q --format domains` is clean for pipelines. |
 
