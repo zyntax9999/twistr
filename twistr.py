@@ -2976,6 +2976,42 @@ def _resolves_to(p):
     return ""
 
 
+def _noise_note(reg):
+    """One fuzzer producing most of the hits usually means noise rather than
+    signal - combosquat words match unrelated businesses, especially for short
+    or dictionary-word brands."""
+    if len(reg) < 200:
+        return ""
+    top, n = collections.Counter(p.fuzzer for p in reg).most_common(1)[0]
+    share = n / len(reg)
+    if share < 0.5:
+        return ""
+    advice = {
+        "dictionary": "brand+keyword matches hit unrelated businesses, "
+                      "especially for short or dictionary-word brands - try "
+                      "--preset phishing, or your own --dictionary",
+        "hosting": "most of these are old, unrelated registrations on free "
+                   "hosts - add --all-checks to see which are actually live "
+                   "pages",
+        "tld-swap": "many of these are the brand's own defensive "
+                    "registrations - check the owner before acting",
+    }.get(top, "consider a narrower --fuzzers set or a --preset")
+    return f"{n:,} of {len(reg):,} findings ({share:.0%}) come from {top}: {advice}"
+
+
+def _band_note(checks, reg):
+    """HIGH needs signals that only the optional checks produce. Without them
+    the band is unreachable, so say that instead of showing a silent '0 high'."""
+    if not reg or any(p.risk >= 70 for p in reg):
+        return ""
+    have_mail = "mx" in checks
+    if not ({"rdap", "web", "favicon"} & set(checks)):
+        extra = "" if have_mail else " (and --mx for mail capability)"
+        return ("no HIGH is possible from DNS alone - registration age, page "
+                f"content and favicon are what push a result over 70{extra}")
+    return ""
+
+
 def _next_step_hint(checks, reg):
     """One actionable line: the cheapest thing that would sharpen these
     results. Only suggests work that has not been done already."""
@@ -3043,8 +3079,11 @@ def _summarize(ui, perms, only_registered, ml, elapsed, total_generated,
     """End-of-run summary: totals, risk mix, per-target table, findings by
     fuzzer, and the top findings ranked by risk across all targets."""
     rows = _rows(perms, only_registered, ml)
+    # ties on risk are common with DNS-only scans, so break them by how
+    # convincing the technique is rather than by alphabet
     reg = sorted((p for p in rows if p.registered),
-                 key=lambda p: (-p.risk, p.target, p.ascii))
+                 key=lambda p: (-p.risk, -_FUZZER_RISK.get(p.fuzzer, 1),
+                                p.target, p.ascii))
     hi = sum(1 for p in reg if p.risk >= 70)
     med = sum(1 for p in reg if 45 <= p.risk < 70)
     low = len(reg) - hi - med
@@ -3148,6 +3187,12 @@ def _summarize(ui, perms, only_registered, ml, elapsed, total_generated,
                 ("  risk  ", "dim"), ("HIGH", "red"), (" >=70   ", "dim"),
                 ("MED", "yellow"), (" 45-69   ", "dim"), ("LOW", "green"),
                 (" <45", "dim")))
+            band = _band_note(checks, reg)
+            if band:
+                parts.append(Text(f"        {band}", style="dim"))
+            noise = _noise_note(reg)
+            if noise:
+                parts.append(Text(f"  note  {noise}", style="yellow"))
             hint = _next_step_hint(checks, reg)
             if hint:
                 parts.append(Text(f"  next  {hint}", style="cyan"))
@@ -3205,6 +3250,12 @@ def _summarize(ui, perms, only_registered, ml, elapsed, total_generated,
                          f"output (--top {min(len(reg), 50)} to see more)",
                          "grey"))
         ui.line(ui.c("  risk  HIGH >=70   MED 45-69   LOW <45", "grey"))
+        band = _band_note(checks, reg)
+        if band:
+            ui.line(ui.c(f"        {band}", "grey"))
+        noise = _noise_note(reg)
+        if noise:
+            ui.line(ui.c(f"  note  {noise}", "yellow"))
         hint = _next_step_hint(checks, reg)
         if hint:
             ui.line(ui.c(f"  next  {hint}", "cyan"))
@@ -3328,14 +3379,25 @@ def main(argv=None):
 
     # validate targets cheaply (constructing a fuzzer parses/splits but does
     # not generate), so an invalid target is reported before any heavy work
-    valid = []
+    valid, seen_reg, dup = [], {}, 0
     for t in targets:
         try:
-            DomainFuzzer(t, dictionary=dictionary, tlds=tlds,
-                         idn_policy=not args.all_idn)
-            valid.append(t)
+            fz = DomainFuzzer(t, dictionary=dictionary, tlds=tlds,
+                              idn_policy=not args.all_idn)
         except ValueError as e:
             ui.warn(f"skip {t!r}: {e}")
+            continue
+        # "amazon.com", "www.amazon.com" and "AMAZON.com" are one scan: the
+        # fuzzers work on the registrable domain, so scanning each spelling
+        # repeats the same work and doubles the results
+        if fz.original in seen_reg:
+            dup += 1
+            continue
+        seen_reg[fz.original] = t
+        valid.append(t)
+    if dup:
+        ui.note(f"skipped {dup} duplicate target"
+                f"{'s' if dup != 1 else ''} (same registrable domain)")
     targets = valid
     if not targets:
         ui.error("no valid targets to scan")
