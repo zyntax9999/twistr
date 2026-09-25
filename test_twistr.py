@@ -739,6 +739,57 @@ def test_top_option_limits_the_findings_list(tmp_path, capsys):
     assert rc == 0
 
 
+def _reg(fuzzer="dictionary", risk=39, **kw):
+    p = perm(fuzzer=fuzzer, dns_a=["1.2.3.4"], **kw)
+    p.risk = risk
+    return p
+
+
+def test_duplicate_spellings_of_one_domain_scan_once(tmp_path):
+    """Bug: a 424-target run scanned amazon.com twice because dedupe compared
+    the raw strings, not the domain the fuzzers actually work on."""
+    out = tmp_path / "o.txt"
+    rc = twistr.main(["amazon.com", "www.amazon.com", "AMAZON.com",
+                      "--no-scan", "--fuzzers", "omission",
+                      "--format", "domains", "-o", str(out)])
+    assert rc == 0
+    names = out.read_text().split()
+    assert len(names) == len(set(names))        # no domain generated twice
+
+
+def test_band_note_explains_an_unreachable_high():
+    """A DNS-only scan cannot score 70, so '0 high' must be explained rather
+    than left looking like a clean bill of health."""
+    reg = [_reg()]
+    assert "no HIGH is possible" in twistr._band_note(set(), reg)
+    assert "--mx" in twistr._band_note(set(), reg)
+    assert "--mx" not in twistr._band_note({"mx"}, reg)
+    assert twistr._band_note({"web", "rdap"}, reg) == ""
+    assert twistr._band_note(set(), [_reg(risk=80)]) == ""
+
+
+def test_noise_note_fires_when_one_fuzzer_dominates():
+    many = [_reg("dictionary") for _ in range(300)] + \
+           [_reg("omission") for _ in range(50)]
+    note = twistr._noise_note(many)
+    assert "dictionary" in note and "86%" in note
+    mixed = [_reg("dictionary") for _ in range(100)] + \
+            [_reg("omission") for _ in range(120)]
+    assert "dictionary" not in twistr._noise_note(mixed)
+    assert twistr._noise_note([_reg() for _ in range(10)]) == ""   # small run
+
+
+def test_ties_rank_by_technique_not_alphabet():
+    """DNS-only scans produce many equal scores; the convincing techniques
+    should still come first."""
+    rows = [_reg("various", 49, domain="zzz.com", ascii_="zzz.com"),
+            _reg("homoglyph", 49, domain="aaa.com", ascii_="aaa.com")]
+    ordered = sorted(rows, key=lambda p: (-p.risk,
+                                          -twistr._FUZZER_RISK.get(p.fuzzer, 1),
+                                          p.target, p.ascii))
+    assert ordered[0].fuzzer == "homoglyph"
+
+
 def test_every_preset_is_valid_and_focused():
     """A preset must name only real fuzzers and must actually narrow the set."""
     for name, spec in twistr._PRESETS.items():
