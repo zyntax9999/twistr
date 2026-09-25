@@ -1,0 +1,15 @@
+# twistr runs on the standard library alone. Everything here is optional and
+# only unlocks extra speed or extra checks; a missing package disables its
+# feature with a one-line note instead of failing.
+
+aiodns>=3.0          # fast async DNS, MX/NS lookups, --nameservers
+aiohttp>=3.8         # --web, --favicon, --rdap
+tldextract>=3.4      # accurate public-suffix splitting
+rich>=13.0           # live dashboard, colour, tables
+idna>=3.4            # robust IDNA / punycode encoding
+ppdeep>=20200505     # homepage content-similarity scoring under --web
+mmh3>=4.0            # Shodan-compatible favicon hashing
+uvloop>=0.17; sys_platform != "win32"   # faster event loop (Linux/macOS)
+
+# development only: run the test suite with `pytest -q`
+# pytest>=7.0
