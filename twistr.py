@@ -421,6 +421,77 @@ _PHONETIC = (
     ("nn", "n"), ("tt", "t"), ("ss", "s"),
 )
 
+# Words that show up on counterfeit / fake-shop domains, as opposed to the
+# credential-phishing words in _DICTIONARY.
+_SHOP_KEYWORDS = (
+    "shop", "store", "outlet", "sale", "sales", "clearance", "discount",
+    "discounts", "cheap", "deal", "deals", "offer", "offers", "official",
+    "originals", "factory", "wholesale", "buy", "online", "shopping", "mall",
+    "market", "bargain", "promo", "promotion", "blackfriday", "cybermonday",
+    "vip", "club", "world", "global", "direct", "warehouse", "surplus",
+    "liquidation", "new", "best", "top", "pro", "plus", "us", "uk", "eu",
+    "de", "fr", "es", "it", "nl", "no", "se", "dk", "fi", "pl",
+)
+
+# TLDs that counterfeit shops favour: cheap, fast to register, weak vetting.
+_SHOP_TLDS = (
+    "shop", "store", "online", "site", "xyz", "top", "vip", "club", "icu",
+    "cyou", "buzz", "sbs", "cfd", "bond", "quest", "monster", "beauty",
+    "boutique", "sale", "deals", "discount", "fashion", "clothing", "shoes",
+    "outlet", "company", "life", "live", "world", "website", "space", "fun",
+    "net", "org", "co", "us", "eu", "de", "uk", "com",
+)
+
+# Named scan profiles. Each picks the fuzzers that matter for one kind of
+# abuse, and may supply its own keyword list, TLD list, or extra checks.
+# Anything given explicitly on the command line still wins.
+_PRESETS = {
+    "fakeshop": {
+        "description": "counterfeit / fake web shops: brand + shop words, "
+                       "cheap TLDs, free hosting",
+        "fuzzers": ["dictionary", "numeral", "separator", "hyphenation",
+                    "tld-swap", "various", "hosting", "omission",
+                    "transposition"],
+        "dictionary": _SHOP_KEYWORDS,
+        "tlds": _SHOP_TLDS,
+    },
+    "phishing": {
+        "description": "credential phishing: lookalikes, login/verify words, "
+                       "free hosting",
+        "fuzzers": ["homoglyph", "dictionary", "hosting", "separator",
+                    "subdomain", "tld-typo", "tld-swap", "bitsquatting",
+                    "numeral"],
+    },
+    "typo": {
+        "description": "genuine typing mistakes: traffic interception and "
+                       "drive-by mistypes",
+        "fuzzers": ["omission", "repetition", "transposition", "replacement",
+                    "insertion", "addition", "vowel-swap", "double-omission",
+                    "reorder", "phonetic", "cardinal", "homophone",
+                    "tld-typo"],
+    },
+    "homograph": {
+        "description": "visual impersonation only: homoglyphs and IDN "
+                       "whole-script look-alikes",
+        "fuzzers": ["homoglyph", "cardinal"],
+    },
+    "bec": {
+        "description": "business email compromise: mail-capable lookalikes "
+                       "(turns on MX lookups)",
+        "fuzzers": ["omission", "transposition", "replacement", "homoglyph",
+                    "separator", "hyphenation", "tld-typo", "tld-swap",
+                    "double-omission"],
+        "mx": True,
+    },
+    "quick": {
+        "description": "fast triage: the highest-yield fuzzers, smallest "
+                       "candidate set",
+        "fuzzers": ["omission", "transposition", "replacement", "tld-typo",
+                    "tld-swap", "hosting", "various"],
+    },
+}
+
+
 # Fuzzers weighted by how convincing / dangerous the result usually is.
 _FUZZER_RISK = {
     "homoglyph": 5, "homoglyph-script": 6, "bitsquatting": 4, "dictionary": 4,
@@ -2467,6 +2538,13 @@ def build_parser():
     p.add_argument("-i", "--input", metavar="FILE",
                    help="read target domains from FILE (one per line; "
                         "blank lines and #comments ignored). Use '-' for stdin.")
+    p.add_argument("--preset", choices=sorted(_PRESETS),
+                   help="scan profile: picks the fuzzers (and sometimes the "
+                        "keywords, TLDs and checks) that matter for one kind "
+                        "of abuse. --list-presets shows what each one does. "
+                        "Anything you pass explicitly still wins.")
+    p.add_argument("--list-presets", action="store_true",
+                   help="print the available presets and exit")
     p.add_argument("--fuzzers", help="comma-separated subset of fuzzers "
                    f"(default all: {','.join(DomainFuzzer._ALL)})")
     p.add_argument("--all-idn", action="store_true",
@@ -3043,6 +3121,27 @@ def main(argv=None):
             ui.line(f"  {name:<16} risk weight {_FUZZER_RISK.get(name, 1)}")
         return 0
 
+    if args.list_presets:
+        ui.rule("presets")
+        for name in sorted(_PRESETS):
+            spec = _PRESETS[name]
+            ui.line(f"  {ui.c(name, 'bold')}")
+            ui.line(f"      {spec['description']}")
+            ui.line(ui.c(f"      fuzzers:  {', '.join(spec['fuzzers'])}",
+                         "grey"))
+            extras = []
+            if spec.get("dictionary"):
+                extras.append(f"{len(spec['dictionary'])} built-in keywords")
+            if spec.get("tlds"):
+                extras.append(f"{len(spec['tlds'])} TLDs")
+            if spec.get("mx"):
+                extras.append("MX lookups on")
+            if extras:
+                ui.line(ui.c(f"      also:     {', '.join(extras)}", "grey"))
+        ui.line()
+        ui.line(ui.c("  use with:  --preset fakeshop", "grey"))
+        return 0
+
     if args.check_resolvers:
         if not _HAVE_AIODNS:
             ui.error("--check-resolvers needs aiodns (pip install aiodns)")
@@ -3091,15 +3190,24 @@ def main(argv=None):
         ui.error(f"cannot read wordlist: {e}")
         return 2
 
+    preset = _PRESETS.get(args.preset) if args.preset else None
     selected = None
     if args.fuzzers:
         selected = [f.strip() for f in args.fuzzers.split(",") if f.strip()]
+    elif preset:
+        selected = list(preset["fuzzers"])
+    if preset:
+        # explicit wordlists beat the preset's built-in ones
+        if dictionary is None and preset.get("dictionary"):
+            dictionary = list(preset["dictionary"])
+        if tlds is None and preset.get("tlds"):
+            tlds = list(preset["tlds"])
 
     # resolve which detection checks are on
     do_web = args.web or args.favicon or args.all_checks
     do_favicon = args.favicon or args.all_checks
     do_rdap = args.rdap or args.all_checks
-    do_mx = args.mx or args.all_checks
+    do_mx = args.mx or args.all_checks or bool(preset and preset.get("mx"))
     later_notes = []          # printed after the header
     if (do_web or do_rdap) and not _HAVE_AIOHTTP:
         later_notes.append(("warn", "web/favicon/rdap checks need aiohttp (not "
@@ -3176,14 +3284,20 @@ def main(argv=None):
                      if len(targets) > 1 else targets[0], "bold"))
         if args.input and args.input != "-":
             rows.append(("input", args.input, None))
+        if args.preset:
+            rows.append(("preset", f"{args.preset} - "
+                         f"{_PRESETS[args.preset]['description']}", "bold"))
         rows.append(("fuzzers", ", ".join(selected) if selected
                      else f"all {len(DomainFuzzer._ALL)}", None))
         if dictionary:
-            rows.append(("dictionary", f"{len(dictionary):,} words · "
-                         f"{os.path.basename(args.dictionary)}", None))
+            src = (os.path.basename(args.dictionary) if args.dictionary
+                   else f"built into --preset {args.preset}")
+            rows.append(("dictionary", f"{len(dictionary):,} words · {src}",
+                         None))
         if tlds:
-            rows.append(("tld list", f"{len(tlds):,} TLDs · "
-                         f"{os.path.basename(args.tld_file)}", None))
+            src = (os.path.basename(args.tld_file) if args.tld_file
+                   else f"built into --preset {args.preset}")
+            rows.append(("tld list", f"{len(tlds):,} TLDs · {src}", None))
         if max_cand:
             samp = " (dictionary sampled evenly)" if dictionary and \
                 len(dictionary) * 4 > max_cand else ""
