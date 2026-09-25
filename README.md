@@ -80,7 +80,7 @@ dependencies at all — but installing the optional libraries unlocks its fast
 path and its richer checks.
 
 ```bash
-git clone https://github.com/YOUR-USERNAME/twistr.git
+git clone https://github.com/zyntax9999/twistr.git
 cd twistr
 
 # optional but strongly recommended (see the table below)
@@ -114,7 +114,7 @@ If you would rather not clone the whole repository, the script is
 self-contained and works on its own:
 
 ```bash
-curl -O https://raw.githubusercontent.com/YOUR-USERNAME/twistr/main/twistr.py
+curl -O https://raw.githubusercontent.com/zyntax9999/twistr/main/twistr.py
 python3 twistr.py --help
 ```
 
