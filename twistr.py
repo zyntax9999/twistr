@@ -2619,6 +2619,8 @@ def build_parser():
                    help="progress style: auto (bar on a terminal, log lines "
                         "when redirected), bar, plain (timestamped lines), "
                         "or none")
+    p.add_argument("--top", type=int, default=15, metavar="N",
+                   help="how many findings to list in the summary (default 15)")
     p.add_argument("-q", "--quiet", action="store_true",
                    help="only print warnings/errors and the final summary "
                         "(no header, no progress, no per-target lines)")
@@ -2950,9 +2952,70 @@ def _resolves_to(p):
     return ""
 
 
+def _next_step_hint(checks, reg):
+    """One actionable line: the cheapest thing that would sharpen these
+    results. Only suggests work that has not been done already."""
+    if not reg:
+        return ""
+    missing = [c for c in ("rdap", "web", "mx") if c not in checks]
+    if missing and len(reg) <= 400:
+        names = {"rdap": "registration age", "web": "page content",
+                 "mx": "mail capability"}
+        what = ", ".join(names[m] for m in missing)
+        return (f"re-run the hits with --all-checks to add {what} "
+                f"- feed this run's output file back in with -i")
+    if "ct" not in checks:
+        return "add --ct to pull lookalikes out of Certificate Transparency logs"
+    return ""
+
+
+def _severity(risk):
+    """Label as well as colour, so the ranking survives a colour-blind reader,
+    a black-and-white terminal and a log file."""
+    if risk >= 70:
+        return "HIGH", "red"
+    if risk >= 45:
+        return "MED", "yellow"
+    return "LOW", "green"
+
+
+def _signals(p):
+    """The short reasons this result scored what it did - the 'why' behind the
+    number, so a row can be judged without opening the CSV."""
+    out = []
+    if p.dns_a or p.dns_aaaa:
+        out.append("live")
+    elif p.dns_cname:
+        out.append("alias")
+    elif p.dns_ns == ["!servfail"]:
+        out.append("lame-ns")
+    elif p.dns_ns:
+        out.append("delegated")
+    if p.dns_mx:
+        out.append("mail")
+    if p.age_days is not None:
+        if p.age_days <= 30:
+            out.append(f"new {p.age_days}d")
+        elif p.age_days <= 365:
+            out.append(f"{p.age_days // 30}mo old")
+    if p.fuzzy is not None and p.fuzzy >= 40:
+        out.append(f"clone {p.fuzzy}%")
+    if p.favicon_match:
+        out.append("same favicon")
+    if p.http_status and p.http_status < 400:
+        out.append(f"http {p.http_status}")
+    if p.ct:
+        out.append("cert")
+    if p.title and p.target:
+        brand = p.target.split(".", 1)[0]
+        if len(brand) >= 3 and brand in p.title.lower():
+            out.append("brand in title")
+    return ", ".join(out)
+
+
 def _summarize(ui, perms, only_registered, ml, elapsed, total_generated,
                live, wild, lame, unresolved, target_stats, out_path=None,
-               n_written=None):
+               n_written=None, top_n=15, checks=()):
     """End-of-run summary: totals, risk mix, per-target table, findings by
     fuzzer, and the top findings ranked by risk across all targets."""
     rows = _rows(perms, only_registered, ml)
@@ -2964,7 +3027,7 @@ def _summarize(ui, perms, only_registered, ml, elapsed, total_generated,
     rate = total_generated / elapsed if elapsed > 0 else 0
     by_fuzzer = collections.Counter(p.fuzzer for p in reg).most_common(8)
     multi = len(target_stats) > 1
-    top = reg[:15]
+    top = reg[:max(0, top_n)]
     filt = [f"{wild} wildcard ignored" if wild else "",
             f"{lame} lame counted" if lame else "",
             f"{unresolved} unresolved" if unresolved else ""]
@@ -3032,27 +3095,38 @@ def _summarize(ui, perms, only_registered, ml, elapsed, total_generated,
                        title="top findings", title_justify="left",
                        title_style="bold")
             ft.add_column("risk", justify="right")
+            ft.add_column("", no_wrap=True)                 # severity label
             ft.add_column("domain", no_wrap=True, overflow="ellipsis",
-                          max_width=42)
+                          max_width=40)
             if multi:
                 ft.add_column("target", style="dim", no_wrap=True)
             ft.add_column("fuzzer", style="dim", no_wrap=True)
+            ft.add_column("why", style="dim", no_wrap=True,
+                          overflow="ellipsis", max_width=34)
             ft.add_column("resolves to", style="dim", no_wrap=True,
-                          overflow="ellipsis", max_width=30)
+                          overflow="ellipsis", max_width=24)
             for p in top:
-                col = "red" if p.risk >= 70 else "yellow" if p.risk >= 45 \
-                    else "green"
+                label, col = _severity(p.risk)
                 dom = p.ascii if p.ascii == p.domain else \
                     f"{p.ascii} ({p.domain})"
-                row = [Text(str(p.risk), style=col), dom]
+                row = [Text(str(p.risk), style=col), Text(label, style=col),
+                       dom]
                 if multi:
                     row.append(p.target)
-                row += [p.fuzzer, _resolves_to(p)]
+                row += [p.fuzzer, _signals(p), _resolves_to(p)]
                 ft.add_row(*row)
             parts += [Text(""), ft]
             if len(reg) > len(top):
                 parts.append(Text(f"  … and {len(reg) - len(top):,} more in "
-                                  f"the output", style="dim"))
+                                  f"the output  (--top {min(len(reg), 50)} "
+                                  f"to see more)", style="dim"))
+            parts.append(Text.assemble(
+                ("  risk  ", "dim"), ("HIGH", "red"), (" >=70   ", "dim"),
+                ("MED", "yellow"), (" 45-69   ", "dim"), ("LOW", "green"),
+                (" <45", "dim")))
+            hint = _next_step_hint(checks, reg)
+            if hint:
+                parts.append(Text(f"  next  {hint}", style="cyan"))
         elif not reg:
             parts += [Text(""), Text("no registered lookalikes found",
                                      style="dim")]
@@ -3097,13 +3171,19 @@ def _summarize(ui, perms, only_registered, ml, elapsed, total_generated,
         wf = max(len(p.fuzzer) for p in top)
         wt = max(len(p.target) for p in top)
         for p in top:
-            col = "red" if p.risk >= 70 else "yellow" if p.risk >= 45 else "grey"
+            label, col = _severity(p.risk)
             tgt = f"  {p.target:<{wt}}" if multi else ""
-            ui.line(f"  {ui.c(f'{p.risk:>3}', col)}  {p.ascii:<{wd}}  "
-                    f"{p.fuzzer:<{wf}}{tgt}  {_resolves_to(p)}")
+            why = _signals(p)
+            ui.line(f"  {ui.c(f'{p.risk:>3}', col)} {ui.c(f'{label:<4}', col)} "
+                    f"{p.ascii:<{wd}}  {p.fuzzer:<{wf}}{tgt}  {why}")
         if len(reg) > len(top):
             ui.line(ui.c(f"  ... and {len(reg) - len(top):,} more in the "
-                         f"output", "grey"))
+                         f"output (--top {min(len(reg), 50)} to see more)",
+                         "grey"))
+        ui.line(ui.c("  risk  HIGH >=70   MED 45-69   LOW <45", "grey"))
+        hint = _next_step_hint(checks, reg)
+        if hint:
+            ui.line(ui.c(f"  next  {hint}", "cyan"))
     elif not reg:
         ui.line()
         ui.line(ui.c("  no registered lookalikes found", "grey"))
@@ -3310,6 +3390,7 @@ def main(argv=None):
                          f"~{mem_budget // 2**30} GB) - consider "
                          f"--max-candidates", "yellow"))
         checks = ["dns (A/AAAA/NS" + ("/MX" if do_mx else "") + ")"]
+
         checks += [n for n, on in (("web", do_web), ("favicon", do_favicon),
                                    ("rdap", do_rdap), ("ct", args.ct)) if on]
         rows.append(("checks", ", ".join(checks), None))
@@ -3394,6 +3475,9 @@ def main(argv=None):
             if getattr(p, "_dns", "") == "fail":
                 unresolved += 1
 
+    active_checks = {n for n, on in (("web", do_web), ("favicon", do_favicon),
+                                     ("rdap", do_rdap), ("mx", do_mx),
+                                     ("ct", args.ct)) if on}
     prog_mode = "none" if quiet else args.progress
     t0 = time.monotonic()
     progress = None
@@ -3562,7 +3646,8 @@ def main(argv=None):
             if not args.no_scan and not quiet:
                 _summarize(ui, perms, args.registered, ml, elapsed,
                            total_generated, live, wild, lame, unresolved,
-                           target_stats)
+                           target_stats, top_n=args.top,
+                           checks=active_checks)
                 ui.line()
             render_table(perms, args.registered, ml)
             return 0
@@ -3576,7 +3661,8 @@ def main(argv=None):
     if not args.no_scan and not quiet:
         _summarize(ui, perms, args.registered, ml, elapsed, total_generated,
                    live, wild, lame, unresolved, target_stats,
-                   out_path=out_path, n_written=n_written if out_path else None)
+                   out_path=out_path, n_written=n_written if out_path else None,
+                   top_n=args.top, checks=active_checks)
     elif out_path and not quiet:
         ui.ok(f"wrote {n_written:,} domains -> {out_path}")
     return 0
