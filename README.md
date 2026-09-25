@@ -869,6 +869,11 @@ validates DNSSEC; a domain with broken DNSSEC then shows up as a lame delegation
   **slower**: dropped queries hold a slot for a full timeout and then need a
   retry round. That is why `auto` backs off; if you fix `--concurrency` by
   hand and the summary reports unresolved domains, lower it.
+- twistr keeps the number of DNS queries down as well as the rate up: a name
+  that does not exist is settled by one NS query, `AAAA` is only asked for when
+  `A` came back empty, and wildcard probes are cached for the whole run instead
+  of being repeated for every target. On a four-brand run using the `hosting`
+  fuzzer that cut queries from 749 to 418.
 - One process tops out around 15,000–17,000 lookups/s of CPU. Beyond that
   (fast local resolver, big lists), `-P N` spreads the work over N cores.
   It gives identical results and works in multi-target mode.
