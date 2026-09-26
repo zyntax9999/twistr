@@ -310,6 +310,7 @@ python twistr.py [domains...] [options]
 | Option | Default | Description |
 |---|---|---|
 | `--concurrency N\|auto` | `auto` | Lookups in flight per process. `auto` starts at 64 and adapts while scanning: it raises the limit while throughput keeps improving, steps back when it stops, and backs off when resolvers start failing. The learned value carries over between targets. A number fixes it. |
+| `--batch-targets N\|auto` | `auto` | Scan several targets in one pass instead of one at a time. Each target otherwise pays its own ramp-up and retry tail, where few lookups are in flight; grouping them keeps the pipe full. `auto` packs targets up to a candidate budget, so small targets travel together and a huge one travels alone. `1` restores one-at-a-time. Measured 1.4× faster on a four-brand run, with identical results. |
 | `-P, --processes N` | `1` | Split each scan across N worker processes to use multiple CPU cores. Works in every mode, including multi-target lists. Only helps once one core is maxed out (see [Performance notes](#performance-notes)). |
 | `--timeout SECS` | `5.0` | Per-query DNS timeout. |
 | `--nameservers LIST` | *(system)* | Comma-separated resolvers, e.g. `1.1.1.1,8.8.4.4` or `127.0.0.1:5335` (needs `aiodns`). The word `unfiltered` expands to a vetted set of 12 unfiltered public resolvers. Multiple resolvers are load-balanced and health-checked at start. Known *filtering* resolvers are refused. See [Choosing resolvers](#choosing-resolvers). |
@@ -874,6 +875,10 @@ validates DNSSEC; a domain with broken DNSSEC then shows up as a lame delegation
   `A` came back empty, and wildcard probes are cached for the whole run instead
   of being repeated for every target. On a four-brand run using the `hosting`
   fuzzer that cut queries from 749 to 418.
+- Targets are scanned in groups (`--batch-targets`). Scanning one target at a
+  time leaves the pipe half-empty at the start and end of every target, which
+  on a list of hundreds is a lot of dead time: grouping four brands into one
+  pass ran 1.4× faster (94s → 66s) and returned exactly the same domains.
 - One process tops out around 15,000–17,000 lookups/s of CPU. Beyond that
   (fast local resolver, big lists), `-P N` spreads the work over N cores.
   It gives identical results and works in multi-target mode.
