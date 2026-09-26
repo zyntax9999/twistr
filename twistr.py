@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 #
 # twistr - typosquatting / phishing lookalike domain scanner
-# Copyright 2026 zyntax9999
+# Copyright 2026 [YOUR NAME OR GITHUB HANDLE]
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -1297,12 +1297,22 @@ class Progress:
     def set_counts(self, wild, lame, unresolved):
         self.s.wild, self.s.lame, self.s.unres = wild, lame, unresolved
 
-    def target_done(self, info):
-        self.s.end_target()
+    def _emit_done(self, info):
         if self.kind == "none":
             return
         self._clear_bar()
         self.ui._emit(_target_done_line(self.ui, info, self.s.n_targets))
+
+    def target_done(self, info):
+        self.s.end_target()
+        self._emit_done(info)
+
+    def batch_done(self, stats):
+        """One scan covered several targets: close it once, credit them all."""
+        self.s.end_target()
+        self.s.targets_done += max(0, len(stats) - 1)
+        for info in stats:
+            self._emit_done(info)
 
     # -- single-pool interface (also called from Scanner / run_scan) ----- #
     def start(self, total):
@@ -1463,9 +1473,12 @@ class Dashboard(Progress):
     def update_target(self, done, live):
         self.s.set_done(done, live)
 
+    def _emit_done(self, info):
+        self.ui._emit(_target_done_line(self.ui, info, self.s.n_targets))
+
     def target_done(self, info):
         self.s.end_target()
-        self.ui._emit(_target_done_line(self.ui, info, self.s.n_targets))
+        self._emit_done(info)
 
     def start(self, total):
         if self.s.in_target:
@@ -1884,8 +1897,14 @@ class Scanner:
         perm.dns_cname = sorted(cnames)
         perm.wildcard = False
         if perm.dns_a or perm.dns_ns or perm.dns_cname:
-            wa, wn, wc, catch_all = await self._wildcard_addrs(
+            wa, wn, wc, catch_all, probe_ok = await self._wildcard_addrs(
                 perm.ascii.split(".", 1)[1])
+            if not probe_ok:
+                # the zone could not be probed (loaded resolver). Counting the
+                # name as registered here is how catch-all hosts leak through,
+                # so hand it to the calm retry pass instead.
+                perm._dns = "fail"
+                return
             ns_same = {n.lower() for n in perm.dns_ns} == wn
             if catch_all and ns_same:
                 perm.wildcard = True        # zone answers for any name
@@ -1903,7 +1922,7 @@ class Scanner:
         concurrent callers share the same probe."""
         hit = _WILD_CACHE.get(parent)
         if hit is not None:
-            return hit
+            return hit + (True,)
         # in-flight probes are shared within this event loop; finished ones are
         # shared with every later target through _WILD_CACHE
         cache = self.__dict__.setdefault("_wild", {})
@@ -1913,19 +1932,24 @@ class Scanner:
         try:
             result = await asyncio.shield(fut)
         except Exception:
-            return set(), set(), set(), False
-        if len(_WILD_CACHE) < _WILD_CACHE_MAX:
-            _WILD_CACHE[parent] = result
+            return set(), set(), set(), False, False
+        # only a conclusive probe is worth keeping for the rest of the run
+        if result[-1] and len(_WILD_CACHE) < _WILD_CACHE_MAX:
+            _WILD_CACHE[parent] = result[:-1]
         return result
 
     async def _probe_wild(self, parent):
         addrs, ns, cn = set(), set(), set()
         answered = probes = 0
+        ok = True
         for _ in range(3):                  # random labels, union of answers
             name = "zq" + "".join(random.choices(
                 string.ascii_lowercase + string.digits, k=14)) + "." + parent
             probes += 1
             st, vals, c = await self._query(name, "A", 3)
+            if st in ("servfail", "fail"):
+                ok = False                  # could not tell: do not guess
+                break
             if st == "nx":
                 break                       # no wildcard in this zone
             if vals:
@@ -1937,8 +1961,8 @@ class Scanner:
         # a zone that answers for every random name answers for anything, so a
         # candidate resolving there is no evidence at all. Catching this by
         # address alone fails on hosts that rotate IPs (vercel, netlify, ...).
-        catch_all = probes >= 2 and answered == probes
-        return addrs, ns, cn, catch_all
+        catch_all = ok and probes >= 2 and answered == probes
+        return addrs, ns, cn, catch_all, ok
 
     async def _resolve_socket(self, perm: Permutation):
         loop = asyncio.get_running_loop()
@@ -2541,6 +2565,33 @@ class LiveWriter:
 __version__ = "1.0.0"
 
 
+# A batch holds every candidate of every target in it, so the budget bounds
+# memory: big targets end up alone, small ones get grouped.
+_BATCH_BUDGET = 250_000
+_BATCH_MAX_TARGETS = 25
+
+
+def _batch_full(setting, n_targets, n_candidates):
+    """Is this batch big enough to scan? The candidate budget is what bounds
+    memory, so one huge target travels alone and small ones travel together."""
+    if setting == "auto":
+        return (n_candidates >= _BATCH_BUDGET
+                or n_targets >= _BATCH_MAX_TARGETS)
+    return n_targets >= setting or n_candidates >= _BATCH_BUDGET * 8
+
+
+def _batch_arg(value):
+    if str(value).lower() == "auto":
+        return "auto"
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("expected a number or 'auto'")
+    if n < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return n
+
+
 def _concurrency_arg(value):
     if str(value).lower() == "auto":
         return "auto"
@@ -2620,6 +2671,14 @@ def build_parser():
                         "starts at 64 and adapts: it raises the limit while "
                         "throughput keeps improving and backs off when the "
                         "resolvers start failing. A number fixes it.")
+    p.add_argument("--batch-targets", type=_batch_arg, default="auto",
+                   metavar="N|auto",
+                   help="scan several targets in one pass instead of one at a "
+                        "time. Each target otherwise pays its own ramp-up and "
+                        "retry tail, where few lookups are in flight. 'auto' "
+                        "(default) packs targets together up to a safe "
+                        "candidate budget; a number fixes the group size; 1 "
+                        "restores one-at-a-time.")
     p.add_argument("-P", "--processes", type=int, default=1,
                    help="split the scan across N worker processes to use "
                         "multiple cores (helps most with --web/ppdeep or very "
@@ -3504,6 +3563,11 @@ def main(argv=None):
         if not args.no_scan:
             conc = ("auto (adaptive, starts at 64)"
                     if args.concurrency == "auto" else str(args.concurrency))
+            if len(targets) > 1 and not args.no_scan:
+                rows.append(("batching", "auto (packed by candidate count)"
+                             if args.batch_targets == "auto"
+                             else f"{args.batch_targets} targets per pass",
+                             None))
             rows.append(("concurrency", conc +
                          (f" × {args.processes} processes"
                           if args.processes > 1 else ""), None))
@@ -3576,14 +3640,31 @@ def main(argv=None):
             if per_target:
                 progress = make_progress(prog_mode, ui)
                 progress.begin(len(targets))
-                for idx, target in enumerate(targets, 1):
-                    try:
-                        fz, tp = gen(target)
-                    except ValueError as e:
-                        ui.error(f"{e} (use --list-fuzzers to see valid names)")
-                        return 2
-                    progress.start_target(idx, len(targets), fz.original,
-                                          _generated_count(tp))
+                pending = list(enumerate(targets, 1))
+                while pending:
+                    # fill one batch: several small targets travel together,
+                    # a huge one travels alone
+                    batch, count = [], 0
+                    while pending:
+                        idx, target = pending[0]
+                        try:
+                            fz, tp = gen(target)
+                        except ValueError as e:
+                            ui.error(f"{e} (use --list-fuzzers to see valid "
+                                     f"names)")
+                            return 2
+                        pending.pop(0)
+                        batch.append((idx, fz, tp))
+                        count += _generated_count(tp)
+                        if _batch_full(args.batch_targets, len(batch), count):
+                            break
+
+                    pool = [p for _, _, tp in batch for p in tp]
+                    last = batch[-1][0]
+                    label = (batch[0][1].original if len(batch) == 1
+                             else f"{len(batch)} targets "
+                                  f"({batch[0][1].original} …)")
+                    progress.start_target(last, len(targets), label, count)
                     tcount = {"done": 0, "live": 0}
 
                     def _cb(p, _tc=tcount):
@@ -3598,21 +3679,25 @@ def main(argv=None):
                         progress.update_target(_tc["done"], _tc["live"])
 
                     t_start = time.monotonic()
-                    tp = run_scan(tp, processes=max(1, args.processes),
-                                  concurrency=args.concurrency,
-                                  timeout=args.timeout, nameservers=nameservers,
-                                  do_web=do_web, do_rdap=do_rdap,
-                                  do_favicon=do_favicon, do_mx=do_mx,
-                                  progress=None, on_result=_cb)
-                    tally(tp)
+                    run_scan(pool, processes=max(1, args.processes),
+                             concurrency=args.concurrency,
+                             timeout=args.timeout, nameservers=nameservers,
+                             do_web=do_web, do_rdap=do_rdap,
+                             do_favicon=do_favicon, do_mx=do_mx,
+                             progress=None, on_result=_cb)
+                    secs = time.monotonic() - t_start
+                    stats = []
+                    for idx, _fz, tp in batch:
+                        tally(tp)
+                        # a shared scan has no honest per-target time
+                        stats.append(_target_stats(
+                            tp, idx=idx, secs=secs if len(batch) == 1 else None))
+                        perms.extend(p for p in tp
+                                     if _passes(p, args.registered, ml))
+                    target_stats.extend(stats)
                     progress.set_counts(wild, lame, unresolved)
-                    st = _target_stats(tp, idx=idx,
-                                       secs=time.monotonic() - t_start)
-                    target_stats.append(st)
-                    perms.extend(p for p in tp
-                                 if _passes(p, args.registered, ml))
-                    progress.target_done(st)
-                    del tp
+                    progress.batch_done(stats)
+                    del batch, pool
             else:
                 for target in targets:
                     try:
