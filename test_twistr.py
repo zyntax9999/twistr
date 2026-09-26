@@ -790,6 +790,52 @@ def test_ties_rank_by_technique_not_alphabet():
     assert ordered[0].fuzzer == "homoglyph"
 
 
+def test_batch_packing_bounds_memory_and_groups_small_targets():
+    """Targets are scanned in groups so each one stops paying its own ramp-up
+    and retry tail, but a group is capped by candidate count so a huge target
+    still travels alone."""
+    B, M = twistr._BATCH_BUDGET, twistr._BATCH_MAX_TARGETS
+    assert not twistr._batch_full("auto", 1, 5_000)        # keep packing
+    assert twistr._batch_full("auto", 1, B)                # one huge target
+    assert twistr._batch_full("auto", M, 10)               # target cap
+    assert twistr._batch_full(4, 4, 10) and not twistr._batch_full(4, 3, 10)
+    assert twistr._batch_full(1, 1, 1)                     # one at a time
+    assert twistr._batch_full(100, 2, B * 8)               # memory backstop
+
+
+def test_batch_targets_argument_validation():
+    assert twistr._batch_arg("auto") == "auto"
+    assert twistr._batch_arg("8") == 8
+    for bad in ("nope", "0", "-2"):
+        with pytest.raises(Exception):
+            twistr._batch_arg(bad)
+
+
+def test_unprobeable_zone_is_not_called_registered():
+    """Bug: under load the wildcard probe times out, and a failed probe was
+    read as 'no wildcard', so catch-all hosts leaked in as real findings."""
+    class FlakyProbe(FakeResolver):
+        async def _query(self, name, rtype):
+            if name.startswith("zq"):            # the random probe labels
+                raise _ares_error(3, "DNS server returned general failure")
+            return await super()._query(name, rtype)
+
+    sc = twistr.Scanner(concurrency=4, timeout=0.2)
+    res = FlakyProbe({"brand.catchall.test": {"A": ["10.0.0.1"]}})
+    sc._resolver = res
+    sc._qfn = res.query_dns
+    sc._loop = asyncio.new_event_loop()
+    p = perm(ascii_="brand.catchall.test", domain="brand.catchall.test")
+    p.deep = True
+
+    async def go():
+        sc._loop = asyncio.get_running_loop()
+        await sc._resolve_aiodns(p, 1)
+    asyncio.run(go())
+    # unsettled, so the calm pass re-checks it rather than reporting it
+    assert getattr(p, "_dns", "") == "fail"
+
+
 def test_every_preset_is_valid_and_focused():
     """A preset must name only real fuzzers and must actually narrow the set."""
     for name, spec in twistr._PRESETS.items():
